@@ -1,0 +1,6 @@
+# Build artifacts
+/target/
+*.bak
+
+# OS files
+.DS_Store

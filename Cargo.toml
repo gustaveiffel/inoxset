@@ -1,0 +1,24 @@
+[package]
+name = "inoxset"
+version = "0.1.0-alpha.1"
+edition = "2021"
+description = "Roaring Bitmap storage engine with time-aware set algebra"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[dependencies]
+roaring = "0.10"
+redb = "~1.4"
+memmap2 = "0.9"
+thiserror = "1"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+env_logger = "0.11"
+
+[[bench]]
+name = "benchmarks"
+harness = false

@@ -2,8 +2,8 @@
 name = "inoxset"
 version = "0.1.0-alpha.1"
 edition = "2021"
-description = "Roaring Bitmap storage engine with time-aware set algebra"
-license = "MIT OR Apache-2.0"
+description = "Embeddable set engine — power segmentation, analytics, and AI recall in real time"
+license = "MIT"
 rust-version = "1.75"
 
 [dependencies]

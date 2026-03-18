@@ -249,34 +249,17 @@ fn delta_compaction_materializes_deletes() {
 // --- Crash recovery ---
 
 #[test]
-fn mempart_loss_on_reopen() {
+fn drop_auto_flushes_data_survives_reopen() {
     let dir = TempDir::new().unwrap();
     {
         let s = store(&dir);
         let mut bm = RoaringBitmap::new();
         bm.insert(42);
         s.put_bitmap("x", Period::Day(2026, 3, 11), bm).unwrap();
-        // NO flush — simulate crash by dropping
-        // Suppress the implicit flush on drop by closing explicitly... actually
-        // we want to simulate data loss, so we just drop without flush.
-        // Drop will call flush_internal, so to avoid that, use close which also
-        // flushes. We need to truly lose data. Since Drop calls flush, let's
-        // use a different approach: test that data survives flush but not
-        // without flush (using close which flushes vs. dropping without close).
-        // Actually InoxSet::Drop calls flush_internal. So the test as written
-        // in the plan won't work — drop WILL flush. Let's just test the
-        // "data survives reopen after flush" test and adapt this one to test
-        // that data is NOT in a fresh empty store.
-        //
-        // NOTE: Drop flushes by design. So this test verifies that data
-        // put_bitmap'd and then drop'd (which flushes) IS readable on reopen.
-        // The plan's intent was for a crash simulation, but Drop-flush is
-        // by-design behavior. We keep the test to verify reopen works.
-        drop(s); // This will flush automatically.
+        // No explicit flush — Drop calls flush_internal by design.
     }
 
     let s2 = store(&dir);
-    // Data was flushed on drop, so it should be available.
     let got = s2.get("x", Period::Day(2026, 3, 11)).unwrap();
     assert!(got.contains(42));
 }

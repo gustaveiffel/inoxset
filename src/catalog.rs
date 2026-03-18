@@ -303,7 +303,12 @@ pub(crate) fn deserialize_u64_vec(ctx: &str, data: &[u8]) -> crate::Result<Vec<u
 /// [event name: u16 LE length + UTF-8 bytes]
 /// [file path: u16 LE length + UTF-8 bytes]
 /// ```
-pub(crate) fn serialize_part(part: &Part) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`InoxSetError::CatalogCorrupted`] if the event name or file path
+/// exceeds 65535 bytes (the maximum representable in the u16 length prefix).
+pub(crate) fn serialize_part(part: &Part) -> crate::Result<Vec<u8>> {
     let mut buf = Vec::new();
     buf.push(1u8); // version
     buf.extend_from_slice(&part.part_id.to_le_bytes());
@@ -319,16 +324,31 @@ pub(crate) fn serialize_part(part: &Part) -> Vec<u8> {
 
     // event name
     let event_bytes = part.event.as_bytes();
-    buf.extend_from_slice(&(event_bytes.len() as u16).to_le_bytes());
+    let event_len =
+        u16::try_from(event_bytes.len()).map_err(|_| InoxSetError::CatalogCorrupted {
+            context: format!(
+                "part_id={}: event name length {} exceeds u16::MAX",
+                part.part_id,
+                event_bytes.len()
+            ),
+        })?;
+    buf.extend_from_slice(&event_len.to_le_bytes());
     buf.extend_from_slice(event_bytes);
 
     // file path
     let path_str = part.file_path.to_string_lossy();
     let path_bytes = path_str.as_bytes();
-    buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+    let path_len = u16::try_from(path_bytes.len()).map_err(|_| InoxSetError::CatalogCorrupted {
+        context: format!(
+            "part_id={}: file path length {} exceeds u16::MAX",
+            part.part_id,
+            path_bytes.len()
+        ),
+    })?;
+    buf.extend_from_slice(&path_len.to_le_bytes());
     buf.extend_from_slice(path_bytes);
 
-    buf
+    Ok(buf)
 }
 
 /// Deserializes a [`Part`] from bytes previously written by [`serialize_part`].
@@ -590,11 +610,12 @@ impl Catalog {
         Ok(out)
     }
 
-    /// Deletes an event and all associated period metadata.
+    /// Deletes an event and all associated period and part metadata in a single
+    /// atomic transaction.
     ///
-    /// Returns the list of `part_id`s that were referenced by the deleted
-    /// period-part entries.  The caller is responsible for deleting the
-    /// corresponding part records and files.
+    /// Removes entries from `events`, `period_parts`, `period_deltas`,
+    /// `period_state`, and `parts`.  Returns the list of `part_id`s that were
+    /// referenced, so the caller can delete the corresponding on-disk files.
     ///
     /// # Errors
     ///
@@ -609,23 +630,19 @@ impl Catalog {
             let mut pp_table = txn.open_table(PERIOD_PARTS)?;
             let mut pd_table = txn.open_table(PERIOD_DELTAS)?;
             let mut ps_table = txn.open_table(PERIOD_STATE)?;
+            let mut parts_table = txn.open_table(PARTS)?;
 
             let prefix = format!("{}/", name);
 
-            // Collect keys to delete from period_parts.
-            let pp_keys: Vec<String> = pp_table
-                .iter()?
-                .filter_map(|item| {
-                    item.ok().and_then(|(k, _)| {
-                        let key = k.value().to_string();
-                        if key.starts_with(&prefix) {
-                            Some(key)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
+            // Collect keys to delete from period_parts, propagating I/O errors.
+            let mut pp_keys: Vec<String> = Vec::new();
+            for item in pp_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value().to_string();
+                if key.starts_with(&prefix) {
+                    pp_keys.push(key);
+                }
+            }
 
             for key in &pp_keys {
                 if let Some(guard) = pp_table.remove(key.as_str())? {
@@ -634,62 +651,118 @@ impl Catalog {
                 }
             }
 
-            // Collect and delete keys from period_deltas.
-            let pd_keys: Vec<String> = pd_table
-                .iter()?
-                .filter_map(|item| {
-                    item.ok().and_then(|(k, _)| {
-                        let key = k.value().to_string();
-                        if key.starts_with(&prefix) {
-                            Some(key)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
+            // Collect and delete keys from period_deltas, propagating I/O errors.
+            let mut pd_keys: Vec<String> = Vec::new();
+            for item in pd_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value().to_string();
+                if key.starts_with(&prefix) {
+                    pd_keys.push(key);
+                }
+            }
             for key in &pd_keys {
                 pd_table.remove(key.as_str())?;
             }
 
-            // Collect and delete keys from period_state.
-            let ps_keys: Vec<String> = ps_table
-                .iter()?
-                .filter_map(|item| {
-                    item.ok().and_then(|(k, _)| {
-                        let key = k.value().to_string();
-                        if key.starts_with(&prefix) {
-                            Some(key)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-
+            // Collect and delete keys from period_state, propagating I/O errors.
+            let mut ps_keys: Vec<String> = Vec::new();
+            for item in ps_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value().to_string();
+                if key.starts_with(&prefix) {
+                    ps_keys.push(key);
+                }
+            }
             for key in &ps_keys {
                 ps_table.remove(key.as_str())?;
+            }
+
+            // Remove the PARTS entries for every part_id collected above.
+            for &pid in &part_ids {
+                parts_table.remove(pid)?;
             }
         }
         txn.commit()?;
         Ok(part_ids)
     }
 
-    /// Deletes an event and all associated period metadata, returning full
-    /// [`Part`] structs instead of just IDs.
+    /// Deletes an event and all associated period and part metadata in a single
+    /// atomic transaction, returning the full [`Part`] structs that were
+    /// removed.
+    ///
+    /// Parts are read from the catalog before removal so that the returned
+    /// structs are complete.
     ///
     /// # Errors
     ///
     /// Returns an error on redb I/O failure or data corruption.
     pub fn delete_event_returning_parts(&self, name: &str) -> crate::Result<Vec<Part>> {
-        let ids = self.delete_event(name)?;
-        let mut parts = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(p) = self.get_part(id)? {
-                parts.push(p);
+        let txn = self.db.begin_write()?;
+        let mut parts: Vec<Part> = Vec::new();
+        {
+            let mut events_table = txn.open_table(EVENTS)?;
+            events_table.remove(name)?;
+
+            let mut pp_table = txn.open_table(PERIOD_PARTS)?;
+            let mut pd_table = txn.open_table(PERIOD_DELTAS)?;
+            let mut ps_table = txn.open_table(PERIOD_STATE)?;
+            let mut parts_table = txn.open_table(PARTS)?;
+
+            let prefix = format!("{}/", name);
+
+            // Collect part IDs from period_parts, propagating I/O errors.
+            let mut pp_keys: Vec<String> = Vec::new();
+            for item in pp_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value().to_string();
+                if key.starts_with(&prefix) {
+                    pp_keys.push(key);
+                }
+            }
+            let mut part_ids: Vec<u64> = Vec::new();
+            for key in &pp_keys {
+                if let Some(guard) = pp_table.remove(key.as_str())? {
+                    let ids = deserialize_u64_vec(key, guard.value())?;
+                    part_ids.extend(ids);
+                }
+            }
+
+            // Delete period_deltas entries, propagating I/O errors.
+            let mut pd_keys: Vec<String> = Vec::new();
+            for item in pd_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value().to_string();
+                if key.starts_with(&prefix) {
+                    pd_keys.push(key);
+                }
+            }
+            for key in &pd_keys {
+                pd_table.remove(key.as_str())?;
+            }
+
+            // Delete period_state entries, propagating I/O errors.
+            let mut ps_keys: Vec<String> = Vec::new();
+            for item in ps_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value().to_string();
+                if key.starts_with(&prefix) {
+                    ps_keys.push(key);
+                }
+            }
+            for key in &ps_keys {
+                ps_table.remove(key.as_str())?;
+            }
+
+            // Read then remove each Part entry so we can return the structs.
+            for pid in part_ids {
+                let ctx = format!("part_id={pid}");
+                if let Some(guard) = parts_table.remove(pid)? {
+                    let part = deserialize_part(&ctx, guard.value())?;
+                    parts.push(part);
+                }
             }
         }
+        txn.commit()?;
         Ok(parts)
     }
 
@@ -861,7 +934,7 @@ impl Catalog {
     pub fn get_period_state(&self, key: &str) -> crate::Result<Option<PeriodState>> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(PERIOD_STATE)?;
-        Self::txn_get_period_state_ro(&table, key)
+        Self::txn_get_period_state(&table, key)
     }
 
     /// Sets the [`PeriodState`] for `key`.
@@ -908,8 +981,13 @@ impl Catalog {
             Some(guard) => guard.value(),
             None => 1u64,
         };
-        table.insert((), start + count)?;
-        Ok((start..start + count).collect())
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| InoxSetError::CatalogCorrupted {
+                context: format!("part ID counter overflow: start={start}, count={count}"),
+            })?;
+        table.insert((), end)?;
+        Ok((start..end).collect())
     }
 
     /// Inserts a [`Part`] record into an open `parts` write table.
@@ -921,7 +999,7 @@ impl Catalog {
         table: &mut redb::Table<u64, &[u8]>,
         part: &Part,
     ) -> crate::Result<()> {
-        let bytes = serialize_part(part);
+        let bytes = serialize_part(part)?;
         table.insert(part.part_id, bytes.as_slice())?;
         Ok(())
     }
@@ -994,15 +1072,16 @@ impl Catalog {
         Ok(())
     }
 
-    /// Reads the [`PeriodState`] for `key` from an open **write** table.
+    /// Reads the [`PeriodState`] for `key` from any readable period-state
+    /// table (both write and read-only tables are accepted).
     ///
     /// Returns `None` when `key` is absent.
     ///
     /// # Errors
     ///
     /// Returns an error on redb I/O failure or an unknown state byte.
-    pub fn txn_get_period_state(
-        table: &redb::Table<&str, u8>,
+    pub fn txn_get_period_state<T: ReadableTable<&'static str, u8>>(
+        table: &T,
         key: &str,
     ) -> crate::Result<Option<PeriodState>> {
         match table.get(key)? {
@@ -1127,26 +1206,6 @@ impl Catalog {
         }
 
         Ok(seen.into_iter().collect())
-    }
-
-    // ─── Private helpers ──────────────────────────────────────────────────────
-
-    /// Reads the [`PeriodState`] from an open **read-only** table.
-    fn txn_get_period_state_ro(
-        table: &redb::ReadOnlyTable<&str, u8>,
-        key: &str,
-    ) -> crate::Result<Option<PeriodState>> {
-        match table.get(key)? {
-            None => Ok(None),
-            Some(guard) => {
-                let byte = guard.value();
-                PeriodState::from_u8(byte)
-                    .map(Some)
-                    .ok_or_else(|| InoxSetError::CatalogCorrupted {
-                        context: format!("period_state '{}': unknown state byte {}", key, byte),
-                    })
-            }
-        }
     }
 }
 

@@ -233,32 +233,50 @@ pub(crate) fn deserialize_period(
     }
 }
 
-/// Serializes a `Vec<u64>` as tightly-packed little-endian 8-byte words.
+/// Serializes a `Vec<u64>` as a version byte followed by tightly-packed
+/// little-endian 8-byte words.
+///
+/// Layout: `[version=1][id0 u64 LE][id1 u64 LE]…`
 pub(crate) fn serialize_u64_vec(ids: &[u64]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(ids.len() * 8);
+    let mut buf = Vec::with_capacity(1 + ids.len() * 8);
+    buf.push(1u8); // version
     for id in ids {
         buf.extend_from_slice(&id.to_le_bytes());
     }
     buf
 }
 
-/// Deserializes a `Vec<u64>` from tightly-packed little-endian 8-byte words.
+/// Deserializes a `Vec<u64>` from bytes previously written by
+/// [`serialize_u64_vec`].
 ///
 /// # Errors
 ///
-/// Returns [`InoxSetError::CatalogCorrupted`] if `data.len()` is not a
+/// Returns [`InoxSetError::CatalogCorrupted`] if `data` is too short, if the
+/// version byte is not `1`, or if the remaining payload length is not a
 /// multiple of 8.
 pub(crate) fn deserialize_u64_vec(ctx: &str, data: &[u8]) -> crate::Result<Vec<u64>> {
-    if data.len() % 8 != 0 {
+    if data.is_empty() {
+        return Err(InoxSetError::CatalogCorrupted {
+            context: format!("{ctx}: u64 list missing version byte"),
+        });
+    }
+    let version = data[0];
+    if version != 1 {
+        return Err(InoxSetError::CatalogCorrupted {
+            context: format!("{ctx}: u64 list unsupported version byte {version} (expected 1)"),
+        });
+    }
+    let payload = &data[1..];
+    if payload.len() % 8 != 0 {
         return Err(InoxSetError::CatalogCorrupted {
             context: format!(
-                "{ctx}: u64 list length {} is not a multiple of 8",
-                data.len()
+                "{ctx}: u64 list payload length {} is not a multiple of 8",
+                payload.len()
             ),
         });
     }
-    let mut out = Vec::with_capacity(data.len() / 8);
-    for chunk in data.chunks_exact(8) {
+    let mut out = Vec::with_capacity(payload.len() / 8);
+    for chunk in payload.chunks_exact(8) {
         // Safety: chunks_exact(8) guarantees exactly 8 bytes.
         let arr: [u8; 8] = chunk
             .try_into()
@@ -691,7 +709,9 @@ impl Catalog {
             id = Self::txn_alloc_part_ids(&mut table, 1)?
                 .into_iter()
                 .next()
-                .expect("txn_alloc_part_ids(1) always returns exactly one id");
+                .ok_or_else(|| InoxSetError::CatalogCorrupted {
+                    context: "txn_alloc_part_ids(1) returned empty vec".to_string(),
+                })?;
         }
         txn.commit()?;
         Ok(id)
@@ -1071,7 +1091,7 @@ impl Catalog {
 
     /// Returns a deduplicated list of all period keys (`"event/gran/period"`)
     /// that reference the given event, drawn from both `period_parts` and
-    /// `period_state` tables.
+    /// `period_deltas` tables.
     ///
     /// Uses a [`HashSet`] internally to guarantee O(n) deduplication.
     ///
@@ -1096,8 +1116,8 @@ impl Catalog {
         }
 
         {
-            let ps_table = txn.open_table(PERIOD_STATE)?;
-            for item in ps_table.iter()? {
+            let pd_table = txn.open_table(PERIOD_DELTAS)?;
+            for item in pd_table.iter()? {
                 let (key, _) = item?;
                 let k = key.value();
                 if k.starts_with(&prefix) {

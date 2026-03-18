@@ -13,3 +13,6 @@ pub mod part_store;
 pub mod period;
 pub mod rollup;
 pub mod types;
+
+/// Crate-wide result alias.
+pub type Result<T> = std::result::Result<T, error::InoxSetError>;

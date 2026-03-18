@@ -93,11 +93,12 @@ pub fn merge_parts(
             path: std::path::PathBuf::from("<merge>"),
             source: e,
         })?;
-    let optimized =
-        RoaringBitmap::deserialize_from(buf.as_slice()).map_err(|_| InoxSetError::BitmapCorrupted {
+    let optimized = RoaringBitmap::deserialize_from(buf.as_slice()).map_err(|_| {
+        InoxSetError::BitmapCorrupted {
             event: String::new(),
             period: crate::types::Period::Static,
-        })?;
+        }
+    })?;
     Ok(optimized)
 }
 

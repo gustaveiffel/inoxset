@@ -97,6 +97,11 @@ pub enum InoxSetError {
     #[error("store is closed")]
     Closed,
 
+    /// A builder or API call was made with an invalid or missing configuration
+    /// value.
+    #[error("configuration error: {0}")]
+    Configuration(String),
+
     /// The catalog database contains data that cannot be interpreted, likely
     /// indicating version skew or on-disk corruption.
     #[error("catalog data corrupted: {context}")]

@@ -143,10 +143,9 @@ impl InoxSetBuilder {
     /// I/O error.
     pub fn open(self) -> crate::Result<crate::InoxSet> {
         // 1. Require path.
-        let path = self.path.ok_or_else(|| InoxSetError::BitmapIo {
-            path: PathBuf::from("<no path>"),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "path required"),
-        })?;
+        let path = self
+            .path
+            .ok_or_else(|| InoxSetError::Configuration("path is required".to_string()))?;
 
         // 2. Create store directory and parts/ sub-directory.
         let parts_root = path.join("parts");
@@ -224,11 +223,14 @@ mod tests {
     #[test]
     fn builder_default_config() {
         let dir = TempDir::new().unwrap();
-        let _store = InoxSetBuilder::new()
+        let store = InoxSetBuilder::new()
             .path(dir.path().join("data"))
             .open()
             .unwrap();
-        // Defaults verified by successful open
+        assert_eq!(store.flush_threshold, 16 * 1024 * 1024);
+        assert!(!store.read_only);
+        assert_eq!(store.default_granularity, crate::types::Granularity::Day);
+        assert_eq!(store.default_rollup, crate::types::Rollup::None);
     }
 
     #[test]

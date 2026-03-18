@@ -1166,6 +1166,50 @@ impl Catalog {
         }
     }
 
+    // ─── Compaction log ───────────────────────────────────────────────────────
+
+    /// Appends a compaction record to the [`COMPACTION_LOG`] table.
+    ///
+    /// The key is the Unix timestamp supplied by the caller. The value is a
+    /// version-1 binary encoding:
+    ///
+    /// ```text
+    /// [version=1 u8]
+    /// [timestamp u64 LE]
+    /// [periods_compacted u32 LE]
+    /// [parts_merged u32 LE]
+    /// [deltas_applied u32 LE]
+    /// [bytes_reclaimed u64 LE]
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on redb I/O failure.
+    pub fn write_compaction_log(
+        &self,
+        timestamp: u64,
+        periods_compacted: u32,
+        parts_merged: u32,
+        deltas_applied: u32,
+        bytes_reclaimed: u64,
+    ) -> crate::Result<()> {
+        let mut buf = Vec::with_capacity(1 + 8 + 4 + 4 + 4 + 8);
+        buf.push(1u8);
+        buf.extend_from_slice(&timestamp.to_le_bytes());
+        buf.extend_from_slice(&periods_compacted.to_le_bytes());
+        buf.extend_from_slice(&parts_merged.to_le_bytes());
+        buf.extend_from_slice(&deltas_applied.to_le_bytes());
+        buf.extend_from_slice(&bytes_reclaimed.to_le_bytes());
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(COMPACTION_LOG)?;
+            table.insert(timestamp, buf.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     // ─── Event scanning ───────────────────────────────────────────────────────
 
     /// Returns a deduplicated list of all period keys (`"event/gran/period"`)

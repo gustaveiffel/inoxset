@@ -148,7 +148,10 @@ impl InoxSet {
 
         // Remove from mempart.
         {
-            let mut mp = self.writer.write().map_err(|_| InoxSetError::Closed)?;
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             mp.bitmaps.retain(|(ev, _), _| ev != name);
             mp.deltas.retain(|(ev, _), _| ev != name);
         }
@@ -225,7 +228,10 @@ impl InoxSet {
         // Write-lock mempart and OR the bitmap.
         let should_flush;
         {
-            let mut mp = self.writer.write().map_err(|_| InoxSetError::Closed)?;
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             mp.or_bitmap(event, period, &bitmap);
             rollup::apply_rollup(&mut mp, &config, &period, &bitmap);
             should_flush = mp.size_bytes() >= self.flush_threshold;
@@ -261,7 +267,10 @@ impl InoxSet {
     /// auto-flush in `put_bitmap`.
     fn flush_internal(&self) -> Result<()> {
         let snapshot = {
-            let mut mp = self.writer.write().map_err(|_| InoxSetError::Closed)?;
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             if mp.is_empty() {
                 return Ok(());
             }
@@ -417,7 +426,10 @@ impl InoxSet {
 
         // Read from mempart (read-lock, then drop).
         let (mp_bitmap, mp_delta) = {
-            let mp = self.writer.read().map_err(|_| InoxSetError::Closed)?;
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             (mp.get_bitmap(event, &period), mp.get_delta(event, &period))
         };
 
@@ -476,13 +488,21 @@ impl InoxSet {
             result -= all_deltas;
         }
 
+        self.metrics.bitmap_read(
+            event,
+            &period,
+            data_part_ids.len() as u32,
+            delta_part_ids.len() as u32,
+            0,
+        );
+
         Ok(result)
     }
 
     /// Retrieves bitmaps for a range of periods (inclusive).
     ///
     /// Returns a vector of `(Period, RoaringBitmap)` tuples for each period
-    /// in the range. Empty bitmaps are included.
+    /// in the range that has at least one set bit. Empty periods are omitted.
     ///
     /// # Errors
     ///
@@ -498,22 +518,56 @@ impl InoxSet {
         let mut results = Vec::with_capacity(periods.len());
         for p in periods {
             let bm = self.get(event, p)?;
-            results.push((p, bm));
+            if !bm.is_empty() {
+                results.push((p, bm));
+            }
         }
         Ok(results)
     }
 
     /// Returns the cardinality (number of set bits) for the given event and period.
     ///
-    /// This is equivalent to `self.get(event, period)?.len()` but may be
-    /// optimized in future versions.
+    /// For compacted periods with a single data part and no in-memory overlay,
+    /// this takes an O(1) fast path by reading the cached cardinality from the
+    /// catalog instead of deserializing the full bitmap.
     ///
     /// # Errors
     ///
     /// Returns an error on catalog or file I/O failure.
     pub fn cardinality(&self, event: &str, period: Period) -> Result<u64> {
-        let bm = self.get(event, period)?;
-        Ok(bm.len())
+        self.check_closed()?;
+
+        // Fast path: compacted period with single part and no mempart overlay.
+        let has_mempart_data;
+        let has_mempart_delta;
+        {
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            has_mempart_data = mp.get_bitmap(event, &period).is_some();
+            has_mempart_delta = mp.get_delta(event, &period).is_some();
+        }
+
+        if !has_mempart_data && !has_mempart_delta {
+            if let Some(config) = self.catalog.get_event(event)? {
+                let cat_key = catalog_key(event, config.finest_granularity, &period);
+                if let Some(state) = self.catalog.get_period_state(&cat_key)? {
+                    if state == PeriodState::Compacted {
+                        let data_ids = self.catalog.get_period_parts(&cat_key)?;
+                        let delta_ids = self.catalog.get_period_deltas(&cat_key)?;
+                        if data_ids.len() == 1 && delta_ids.is_empty() {
+                            if let Some(part) = self.catalog.get_part(data_ids[0])? {
+                                return Ok(part.cardinality);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Slow path: full merge.
+        Ok(self.get(event, period)?.len())
     }
 
     /// Returns `true` if the event has any data for the given period.
@@ -618,7 +672,10 @@ impl InoxSet {
         }
 
         {
-            let mut mp = self.writer.write().map_err(|_| InoxSetError::Closed)?;
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             mp.or_delta(event, period, &delta);
             rollup::apply_rollup_delta(&mut mp, &config, &period, &delta);
         }
@@ -643,16 +700,27 @@ impl InoxSet {
 
         // Clear mempart entries for this event/period.
         {
-            let mut mp = self.writer.write().map_err(|_| InoxSetError::Closed)?;
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             mp.bitmaps.remove(&(event.to_string(), period));
             mp.deltas.remove(&(event.to_string(), period));
         }
 
         let cat_key = catalog_key(event, config.finest_granularity, &period);
 
-        // Collect old part IDs before replace.
+        // Pre-collect old part IDs and file paths BEFORE the transaction,
+        // because the txn will remove those catalog entries making them
+        // unreachable afterwards (C3 fix).
         let old_data_ids = self.catalog.get_period_parts(&cat_key)?;
         let old_delta_ids = self.catalog.get_period_deltas(&cat_key)?;
+        let mut old_file_paths = Vec::new();
+        for &pid in old_data_ids.iter().chain(old_delta_ids.iter()) {
+            if let Some(part) = self.catalog.get_part(pid)? {
+                old_file_paths.push(part.file_path);
+            }
+        }
 
         // Write new part file.
         let now = self.now_unix();
@@ -718,23 +786,12 @@ impl InoxSet {
         }
         txn.commit()?;
 
-        // Delete old part files after commit.
-        for pid in old_data_ids.iter().chain(old_delta_ids.iter()) {
-            if let Some(part) = self.catalog.get_part(*pid)? {
-                let _ = part_store::delete_part(&part.file_path);
+        // Delete old part files after commit using the pre-collected paths.
+        for path in &old_file_paths {
+            if path.exists() {
+                let _ = part_store::delete_part(path);
             }
         }
-        // Old parts were removed from catalog in txn above, so get_part will
-        // return None. We need to resolve paths ourselves.
-        // Actually, old parts are gone from the catalog. We need to have
-        // collected their file paths before the txn commit. Let me fix this:
-        // The old parts were removed from the parts table inside the txn, so
-        // after commit they are gone. We should pre-collect the file paths.
-        // However, the code above removes them in the txn. Let me restructure
-        // to collect paths first.
-        //
-        // In practice the old files are orphans and will be cleaned on next
-        // open. For now this is acceptable.
 
         Ok(())
     }
@@ -756,7 +813,10 @@ impl InoxSet {
 
         // Clear mempart entries.
         {
-            let mut mp = self.writer.write().map_err(|_| InoxSetError::Closed)?;
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             for (period, _) in entries {
                 mp.bitmaps.remove(&(event.to_string(), *period));
                 mp.deltas.remove(&(event.to_string(), *period));
@@ -858,6 +918,12 @@ impl InoxSet {
     /// # Errors
     ///
     /// Returns an error on catalog or file I/O failure.
+    ///
+    /// # Platform notes
+    ///
+    /// Concurrent `get()` + `compact()` is safe on Unix: unlink semantics keep
+    /// memory-mapped files valid until the last handle closes. On Windows,
+    /// concurrent compact + read may fail if part files are memory-mapped.
     pub fn compact(&self) -> Result<CompactStats> {
         self.check_writable()?;
         let mut stats = CompactStats::default();
@@ -874,6 +940,15 @@ impl InoxSet {
             stats.deltas_applied,
             stats.bytes_reclaimed,
         );
+        // Write compaction record to the compaction log (C2 fix).
+        let now = self.now_unix();
+        self.catalog.write_compaction_log(
+            now,
+            stats.periods_compacted,
+            stats.parts_merged,
+            stats.deltas_applied,
+            stats.bytes_reclaimed,
+        )?;
         Ok(stats)
     }
 
@@ -1022,7 +1097,10 @@ impl InoxSet {
         self.check_closed()?;
 
         let (mempart_size_bytes, mempart_entries) = {
-            let mp = self.writer.read().map_err(|_| InoxSetError::Closed)?;
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
             (mp.size_bytes(), (mp.bitmaps.len() + mp.deltas.len()) as u32)
         };
 
@@ -1037,11 +1115,18 @@ impl InoxSet {
         let mut compacted_periods = 0u32;
         let mut periods_needing_compaction = 0u32;
 
+        // Single batched read transaction for all per-period lookups (I1 fix).
+        let txn = self.catalog.db().begin_read()?;
+        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
+        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
+        let ps_table = txn.open_table(catalog::PERIOD_STATE)?;
+        let parts_table = txn.open_table(catalog::PARTS)?;
+
         for ev in &events {
             let keys = self.catalog.period_keys_for_event(&ev.name)?;
             for key in &keys {
-                let data_ids = self.catalog.get_period_parts(key)?;
-                let delta_ids = self.catalog.get_period_deltas(key)?;
+                let data_ids = Catalog::txn_get_period_parts(&pp_table, key)?;
+                let delta_ids = Catalog::txn_get_period_deltas(&pd_table, key)?;
 
                 total_data_parts += data_ids.len() as u64;
                 total_delta_parts += delta_ids.len() as u64;
@@ -1052,13 +1137,13 @@ impl InoxSet {
 
                 // Count disk usage.
                 for &pid in data_ids.iter().chain(delta_ids.iter()) {
-                    if let Some(part) = self.catalog.get_part(pid)? {
+                    if let Some(part) = Catalog::txn_get_part(&parts_table, pid)? {
                         disk_usage_bytes += part.size_bytes;
                     }
                 }
 
                 // Count period states.
-                if let Some(state) = self.catalog.get_period_state(key)? {
+                if let Some(state) = Catalog::txn_get_period_state(&ps_table, key)? {
                     match state {
                         PeriodState::Open => open_periods += 1,
                         PeriodState::Closed => closed_periods += 1,
@@ -1580,5 +1665,193 @@ mod tests {
         // After close, operations should fail.
         let result = store.put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[3]));
         assert!(matches!(result, Err(InoxSetError::Closed)));
+    }
+
+    // ─── Eng Decision 6: 7 mandatory tests ───────────────────────────────────
+
+    #[test]
+    fn auto_flush_on_threshold() {
+        let dir = TempDir::new().unwrap();
+        // Set flush threshold to 1 byte so any write triggers auto-flush.
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .default_granularity(Granularity::Day)
+            .default_rollup(Rollup::None)
+            .mempart_flush_threshold(1)
+            .clock(|| 1_773_500_000)
+            .open()
+            .unwrap();
+
+        store
+            .put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[1, 2, 3]))
+            .unwrap();
+        store
+            .put_bitmap("ev", Period::Day(2026, 3, 12), bitmap_with(&[4, 5, 6]))
+            .unwrap();
+
+        // Auto-flush should have fired; mempart should be empty.
+        let h = store.health().unwrap();
+        assert_eq!(h.mempart_entries, 0, "mempart should be empty after auto-flush");
+        assert!(h.total_data_parts > 0, "data parts should exist on disk");
+    }
+
+    #[test]
+    fn backfill_reverts_compacted_to_closed() {
+        let (store, _dir) = test_store();
+        let period = Period::Day(2025, 1, 1); // historical/closed period
+
+        // Write + flush twice so compact has two parts to merge (is_eligible requires > 1).
+        store
+            .put_bitmap("ev", period, bitmap_with(&[1, 2]))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .put_bitmap("ev", period, bitmap_with(&[3]))
+            .unwrap();
+        store.flush().unwrap();
+
+        store.compact().unwrap();
+
+        // Period is now Compacted.
+        let cat_key = catalog_key("ev", Granularity::Day, &period);
+        let state = store.catalog.get_period_state(&cat_key).unwrap();
+        assert_eq!(state, Some(PeriodState::Compacted));
+
+        // Writing to a compacted period (backfill) should revert state to Closed
+        // and accept the write.
+        store
+            .put_bitmap("ev", period, bitmap_with(&[99]))
+            .unwrap();
+
+        // The mempart now has data for this period.
+        let bm = store.get("ev", period).unwrap();
+        assert!(bm.contains(99), "backfill data should be readable");
+
+        // Period state should be reverted to Closed.
+        let state_after = store.catalog.get_period_state(&cat_key).unwrap();
+        assert_eq!(state_after, Some(PeriodState::Closed));
+    }
+
+    #[test]
+    fn cardinality_fast_path_compacted() {
+        let (store, _dir) = test_store();
+        let period = Period::Day(2025, 6, 1);
+
+        // Write + flush twice so compact has two parts to merge (is_eligible requires > 1).
+        store
+            .put_bitmap("ev", period, bitmap_with(&[10, 20]))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .put_bitmap("ev", period, bitmap_with(&[30]))
+            .unwrap();
+        store.flush().unwrap();
+
+        store.compact().unwrap();
+
+        // After compact: single part, Compacted state, no mempart overlay.
+        let card = store.cardinality("ev", period).unwrap();
+        assert_eq!(card, 3, "fast-path cardinality should return 3");
+    }
+
+    #[test]
+    fn read_only_rejects_writes() {
+        let dir = TempDir::new().unwrap();
+        // First, create the store to initialize the database.
+        {
+            let store = InoxSet::builder()
+                .path(dir.path().join("data"))
+                .default_granularity(Granularity::Day)
+                .default_rollup(Rollup::None)
+                .clock(|| 1_773_500_000)
+                .open()
+                .unwrap();
+            store
+                .put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[1]))
+                .unwrap();
+            store.close().unwrap();
+        }
+        // Reopen read-only.
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .read_only(true)
+            .clock(|| 1_773_500_000)
+            .open()
+            .unwrap();
+        let result = store.put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[2]));
+        assert!(
+            matches!(result, Err(InoxSetError::ReadOnly)),
+            "read-only store should reject writes"
+        );
+    }
+
+    #[test]
+    fn closed_rejects_operations() {
+        let (store, _dir) = test_store();
+        store.close().unwrap();
+        let result = store.put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[1]));
+        assert!(
+            matches!(result, Err(InoxSetError::Closed)),
+            "closed store should return Closed error"
+        );
+    }
+
+    #[test]
+    fn compact_event_only_compacts_target() {
+        let (store, _dir) = test_store();
+
+        // Write two flushes to event "a".
+        store
+            .put_bitmap("a", Period::Day(2026, 3, 11), bitmap_with(&[1]))
+            .unwrap();
+        store.flush().unwrap();
+        store
+            .put_bitmap("a", Period::Day(2026, 3, 11), bitmap_with(&[2]))
+            .unwrap();
+        store.flush().unwrap();
+
+        // Write one flush to event "b".
+        store
+            .put_bitmap("b", Period::Day(2026, 3, 11), bitmap_with(&[10]))
+            .unwrap();
+        store.flush().unwrap();
+
+        let cat_key_a = catalog_key("a", Granularity::Day, &Period::Day(2026, 3, 11));
+        let cat_key_b = catalog_key("b", Granularity::Day, &Period::Day(2026, 3, 11));
+
+        let parts_b_before = store.catalog.get_period_parts(&cat_key_b).unwrap().len();
+        assert_eq!(parts_b_before, 1, "event b should have 1 part before compact");
+
+        // Compact only event "a".
+        store.compact_event("a").unwrap();
+
+        let parts_a_after = store.catalog.get_period_parts(&cat_key_a).unwrap().len();
+        assert_eq!(parts_a_after, 1, "event a should have 1 merged part after compact");
+
+        let parts_b_after = store.catalog.get_period_parts(&cat_key_b).unwrap().len();
+        assert_eq!(
+            parts_b_after, parts_b_before,
+            "event b should be unaffected by compact_event(a)"
+        );
+    }
+
+    #[test]
+    fn get_with_missing_part_file() {
+        let (store, _dir) = test_store();
+        store
+            .put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[1, 2, 3]))
+            .unwrap();
+        store.flush().unwrap();
+
+        // Find and delete the part file on disk.
+        let cat_key = catalog_key("ev", Granularity::Day, &Period::Day(2026, 3, 11));
+        let part_ids = store.catalog.get_period_parts(&cat_key).unwrap();
+        assert!(!part_ids.is_empty(), "should have at least one part");
+        let part = store.catalog.get_part(part_ids[0]).unwrap().unwrap();
+        std::fs::remove_file(&part.file_path).expect("delete part file");
+
+        // get() should return an error, not panic.
+        let result = store.get("ev", Period::Day(2026, 3, 11));
+        assert!(result.is_err(), "get() should fail when part file is missing");
     }
 }

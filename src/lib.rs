@@ -1011,7 +1011,6 @@ impl InoxSet {
             })?;
         let event = &representative.event;
         let period = representative.period;
-        let _gran = period.granularity();
 
         // Allocate new part ID and write merged file.
         let now = self.now_unix();
@@ -1691,7 +1690,10 @@ mod tests {
 
         // Auto-flush should have fired; mempart should be empty.
         let h = store.health().unwrap();
-        assert_eq!(h.mempart_entries, 0, "mempart should be empty after auto-flush");
+        assert_eq!(
+            h.mempart_entries, 0,
+            "mempart should be empty after auto-flush"
+        );
         assert!(h.total_data_parts > 0, "data parts should exist on disk");
     }
 
@@ -1705,9 +1707,7 @@ mod tests {
             .put_bitmap("ev", period, bitmap_with(&[1, 2]))
             .unwrap();
         store.flush().unwrap();
-        store
-            .put_bitmap("ev", period, bitmap_with(&[3]))
-            .unwrap();
+        store.put_bitmap("ev", period, bitmap_with(&[3])).unwrap();
         store.flush().unwrap();
 
         store.compact().unwrap();
@@ -1719,9 +1719,7 @@ mod tests {
 
         // Writing to a compacted period (backfill) should revert state to Closed
         // and accept the write.
-        store
-            .put_bitmap("ev", period, bitmap_with(&[99]))
-            .unwrap();
+        store.put_bitmap("ev", period, bitmap_with(&[99])).unwrap();
 
         // The mempart now has data for this period.
         let bm = store.get("ev", period).unwrap();
@@ -1742,9 +1740,7 @@ mod tests {
             .put_bitmap("ev", period, bitmap_with(&[10, 20]))
             .unwrap();
         store.flush().unwrap();
-        store
-            .put_bitmap("ev", period, bitmap_with(&[30]))
-            .unwrap();
+        store.put_bitmap("ev", period, bitmap_with(&[30])).unwrap();
         store.flush().unwrap();
 
         store.compact().unwrap();
@@ -1820,13 +1816,19 @@ mod tests {
         let cat_key_b = catalog_key("b", Granularity::Day, &Period::Day(2026, 3, 11));
 
         let parts_b_before = store.catalog.get_period_parts(&cat_key_b).unwrap().len();
-        assert_eq!(parts_b_before, 1, "event b should have 1 part before compact");
+        assert_eq!(
+            parts_b_before, 1,
+            "event b should have 1 part before compact"
+        );
 
         // Compact only event "a".
         store.compact_event("a").unwrap();
 
         let parts_a_after = store.catalog.get_period_parts(&cat_key_a).unwrap().len();
-        assert_eq!(parts_a_after, 1, "event a should have 1 merged part after compact");
+        assert_eq!(
+            parts_a_after, 1,
+            "event a should have 1 merged part after compact"
+        );
 
         let parts_b_after = store.catalog.get_period_parts(&cat_key_b).unwrap().len();
         assert_eq!(
@@ -1852,6 +1854,9 @@ mod tests {
 
         // get() should return an error, not panic.
         let result = store.get("ev", Period::Day(2026, 3, 11));
-        assert!(result.is_err(), "get() should fail when part file is missing");
+        assert!(
+            result.is_err(),
+            "get() should fail when part file is missing"
+        );
     }
 }

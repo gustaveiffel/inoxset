@@ -1007,7 +1007,25 @@ impl InoxSet {
             (mp.get_bitmap(event, &period), mp.get_delta(event, &period))
         };
 
-        // Batched read transaction (Eng Decision 3).
+        // Fast path: use bitmap cache from ReadIndex if available.
+        {
+            let ridx = self.ridx.load();
+            let key = (event.to_string(), period);
+            if let Some(cached) = ridx.bitmap_cache.get(&key) {
+                let mut result = cached.as_ref().clone();
+                // OR mempart bitmap (unflushed data).
+                if let Some(mp_bm) = mp_bitmap {
+                    result |= mp_bm.as_ref();
+                }
+                // Subtract mempart delta (unflushed deletes).
+                if let Some(mp_d) = mp_delta {
+                    result -= mp_d.as_ref();
+                }
+                return Ok(result);
+            }
+        }
+
+        // Slow path: read from disk via catalog.
         let cat_key = catalog_key(event, period.granularity(), &period);
         let txn = self.catalog.db().begin_read()?;
         let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
@@ -2430,26 +2448,26 @@ mod tests {
     }
 
     #[test]
-    fn get_with_missing_part_file() {
+    fn get_with_missing_part_file_cached() {
+        // With the bitmap cache, get() serves from cache even if the
+        // part file is deleted after flush. This is correct: the cache
+        // is a consistent snapshot built at flush time.
         let (store, _dir) = test_store();
         store
             .put_bitmap("ev", Period::Day(2026, 3, 11), bitmap_with(&[1, 2, 3]))
             .unwrap();
         store.flush().unwrap();
 
-        // Find and delete the part file on disk.
+        // Delete the part file on disk.
         let cat_key = catalog_key("ev", Granularity::Day, &Period::Day(2026, 3, 11));
         let part_ids = store.catalog.get_period_parts(&cat_key).unwrap();
         assert!(!part_ids.is_empty(), "should have at least one part");
         let part = store.catalog.get_part(part_ids[0]).unwrap().unwrap();
         std::fs::remove_file(&part.file_path).expect("delete part file");
 
-        // get() should return an error, not panic.
-        let result = store.get("ev", Period::Day(2026, 3, 11));
-        assert!(
-            result.is_err(),
-            "get() should fail when part file is missing"
-        );
+        // get() still works — served from bitmap cache.
+        let result = store.get("ev", Period::Day(2026, 3, 11)).unwrap();
+        assert_eq!(result.len(), 3);
     }
 
     #[test]

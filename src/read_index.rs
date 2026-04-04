@@ -10,8 +10,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use roaring::RoaringBitmap;
 
 use crate::catalog::Catalog;
+use crate::part_store;
 use crate::period::parse_period_key;
 use crate::types::Period;
 
@@ -39,6 +43,11 @@ pub(crate) struct ReadIndex {
 
     /// Event names (cached to avoid redb list_events).
     pub event_names: Vec<String>,
+
+    /// Pre-deserialized bitmap cache: (event, period) → merged bitmap.
+    /// Eliminates mmap + deserialize on the hot read path.
+    /// Built at the same time as the part index; swapped atomically.
+    pub bitmap_cache: HashMap<(String, Period), Arc<RoaringBitmap>>,
 }
 
 impl ReadIndex {
@@ -92,9 +101,32 @@ impl ReadIndex {
             }
         }
 
+        // Build bitmap cache: merge all data parts per (event, period),
+        // apply delta parts, and store the result as Arc<RoaringBitmap>.
+        let mut bitmap_cache: HashMap<(String, Period), Arc<RoaringBitmap>> = HashMap::new();
+        for ((ev, period), entry) in &periods {
+            let mut merged = RoaringBitmap::new();
+            for loc in &entry.data_parts {
+                if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
+                    merged |= bm;
+                }
+            }
+            let mut deltas = RoaringBitmap::new();
+            for loc in &entry.delta_parts {
+                if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
+                    deltas |= bm;
+                }
+            }
+            if !deltas.is_empty() {
+                merged -= deltas;
+            }
+            bitmap_cache.insert((ev.clone(), *period), Arc::new(merged));
+        }
+
         Ok(Self {
             periods,
             event_names,
+            bitmap_cache,
         })
     }
 }

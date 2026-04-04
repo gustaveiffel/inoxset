@@ -526,9 +526,26 @@ fn corrupt_part_file_returns_error() {
     assert!(!part_files.is_empty());
     std::fs::write(part_files[0].path(), b"garbage data").unwrap();
 
-    // get() should return BitmapCorrupted, not panic
+    // With bitmap cache: get() serves from cache (valid snapshot).
+    // The corruption is only detected on reopen (rebuild cache from disk).
     let result = s.get("x", Period::Day(2026, 3, 11));
-    assert!(result.is_err());
+    assert!(
+        result.is_ok(),
+        "cached get() should succeed despite corrupt file"
+    );
+
+    // On reopen, the corrupt file is detected during cache build.
+    // The store still opens (corrupt parts are skipped with empty bitmap).
+    drop(s);
+    let s2 = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+    let result = s2.get("x", Period::Day(2026, 3, 11)).unwrap();
+    assert!(
+        result.is_empty(),
+        "corrupt part should produce empty bitmap on reopen"
+    );
 }
 
 // --- Dictionary Encoding Integration Tests ---

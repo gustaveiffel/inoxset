@@ -12,6 +12,7 @@ redb = "~1.4"
 memmap2 = "0.9"
 thiserror = "1"
 log = "0.4"
+arc-swap = "1.9.1"
 
 [dev-dependencies]
 tempfile = "3"

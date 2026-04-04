@@ -12,6 +12,7 @@ pub mod merge;
 pub mod metrics;
 pub mod part_store;
 pub mod period;
+pub(crate) mod read_index;
 pub mod rollup;
 pub mod types;
 
@@ -19,11 +20,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use arc_swap::ArcSwap;
+
 use roaring::RoaringBitmap;
 
 use crate::catalog::Catalog;
-use redb::ReadableTable;
-
 use crate::error::{validate_event_name, InoxSetError};
 use crate::mempart::MemPartSnapshot;
 use crate::period::catalog_key;
@@ -43,8 +44,9 @@ pub struct InoxSet {
     pub(crate) path: PathBuf,
     pub(crate) parts_root: PathBuf,
     pub(crate) catalog: catalog::Catalog,
-    // Future: consider arc_swap::ArcSwap for lock-free reads if benchmarks show contention
     pub(crate) writer: RwLock<mempart::MemPart>,
+    /// Lock-free read index — caches catalog metadata to skip redb lookups.
+    pub(crate) ridx: ArcSwap<read_index::ReadIndex>,
     pub(crate) default_granularity: types::Granularity,
     pub(crate) default_rollup: types::Rollup,
     pub(crate) metrics: Arc<dyn metrics::Metrics>,
@@ -73,6 +75,16 @@ impl InoxSet {
         if self.closed.load(Ordering::SeqCst) {
             return Err(InoxSetError::Closed);
         }
+        Ok(())
+    }
+
+    /// Rebuilds the in-memory read index from the catalog.
+    ///
+    /// Called after flush, compact, delete_period, drop_event — any operation
+    /// that mutates the catalog's part/period metadata.
+    fn rebuild_read_index(&self) -> Result<()> {
+        let idx = read_index::ReadIndex::build(&self.catalog)?;
+        self.ridx.store(Arc::new(idx));
         Ok(())
     }
 
@@ -188,6 +200,7 @@ impl InoxSet {
 
         // Remove from catalog, getting parts back so we can delete files.
         let parts = self.catalog.delete_event_returning_parts(name)?;
+        self.rebuild_read_index()?;
         for part in &parts {
             if part.file_path.exists() {
                 let _ = part_store::delete_part(&part.file_path);
@@ -230,6 +243,7 @@ impl InoxSet {
 
         let cat_key = period::catalog_key(event, config.finest_granularity, &period);
         let parts = self.catalog.delete_period_returning_parts(&cat_key)?;
+        self.rebuild_read_index()?;
         for part in &parts {
             if part.file_path.exists() {
                 let _ = part_store::delete_part(&part.file_path);
@@ -286,56 +300,40 @@ impl InoxSet {
     pub fn find_memberships(&self, external_id: &str) -> Result<Vec<(String, Period)>> {
         self.check_closed()?;
 
+        // Load the read index (lock-free via ArcSwap).
+        let idx = self.ridx.load();
+
         // Phase 1: resolve dict IDs per event.
-        let events = self.catalog.list_events()?;
         let mut event_ids: Vec<(String, u32)> = Vec::new();
-        for ev in &events {
-            if let Some(id) = dict::lookup(self.catalog.db(), &ev.name, external_id)? {
-                event_ids.push((ev.name.clone(), id));
+        for ev in &idx.event_names {
+            if let Some(id) = dict::lookup(self.catalog.db(), ev, external_id)? {
+                event_ids.push((ev.clone(), id));
             }
         }
         if event_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 2: single batched read txn — collect all part file paths + bytes.
-        let txn = self.catalog.db().begin_read()?;
-        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-        let parts_table = txn.open_table(catalog::PARTS)?;
-
-        // Pre-read all part files into an in-memory cache to avoid repeated
-        // open() syscalls. Key = part_id, Value = file bytes.
-        let mut file_cache: std::collections::HashMap<u64, Vec<u8>> =
+        // Phase 2: scan the in-memory index — zero redb lookups.
+        let mut memberships = Vec::new();
+        let mut file_cache: std::collections::HashMap<PathBuf, Vec<u8>> =
             std::collections::HashMap::new();
 
-        let mut memberships = Vec::new();
-
         for (event_name, internal_id) in &event_ids {
-            // Prefix scan for this event's period keys.
-            let prefix = format!("{}/", event_name);
-            let mut period_keys: Vec<String> = Vec::new();
-            for item in pp_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value();
-                if key.starts_with(&prefix) {
-                    period_keys.push(key.to_string());
+            for ((ev, period), entry) in &idx.periods {
+                if ev != event_name {
+                    continue;
                 }
-            }
 
-            for cat_key in &period_keys {
-                let data_ids = Catalog::txn_get_period_parts(&pp_table, cat_key)?;
-
+                // Check data parts via serialized_contains.
                 let mut found = false;
-                for pid in &data_ids {
-                    if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
-                        let bytes = file_cache
-                            .entry(*pid)
-                            .or_insert_with(|| std::fs::read(&part.file_path).unwrap_or_default());
-                        if part_store::serialized_contains(bytes, *internal_id) {
-                            found = true;
-                            break;
-                        }
+                for loc in &entry.data_parts {
+                    let bytes = file_cache
+                        .entry(loc.file_path.clone())
+                        .or_insert_with(|| std::fs::read(&loc.file_path).unwrap_or_default());
+                    if part_store::serialized_contains(bytes, *internal_id) {
+                        found = true;
+                        break;
                     }
                 }
                 if !found {
@@ -343,28 +341,21 @@ impl InoxSet {
                 }
 
                 // Check tombstones.
-                let delta_ids = Catalog::txn_get_period_deltas(&pd_table, cat_key)?;
                 let mut tombstoned = false;
-                for pid in &delta_ids {
-                    if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
-                        let bytes = file_cache
-                            .entry(*pid)
-                            .or_insert_with(|| std::fs::read(&part.file_path).unwrap_or_default());
-                        if part_store::serialized_contains(bytes, *internal_id) {
-                            tombstoned = true;
-                            break;
-                        }
+                for loc in &entry.delta_parts {
+                    let bytes = file_cache
+                        .entry(loc.file_path.clone())
+                        .or_insert_with(|| std::fs::read(&loc.file_path).unwrap_or_default());
+                    if part_store::serialized_contains(bytes, *internal_id) {
+                        tombstoned = true;
+                        break;
                     }
                 }
                 if tombstoned {
                     continue;
                 }
 
-                if let Some(period_key) = cat_key.splitn(3, '/').nth(2) {
-                    if let Some(period) = period::parse_period_key(period_key) {
-                        memberships.push((event_name.clone(), period));
-                    }
-                }
+                memberships.push((event_name.clone(), *period));
             }
         }
 
@@ -450,21 +441,20 @@ impl InoxSet {
             }
         }
 
-        // Check disk parts via serialized contains (zero-copy).
-        let cat_key = period::catalog_key(event, period.granularity(), &period);
-        let txn = self.catalog.db().begin_read()?;
-        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-        let parts_table = txn.open_table(catalog::PARTS)?;
+        // Check disk parts via read index (zero redb lookups).
+        let idx = self.ridx.load();
+        let key = (event.to_string(), period);
 
-        let data_part_ids = Catalog::txn_get_period_parts(&pp_table, &cat_key)?;
+        let entry = match idx.periods.get(&key) {
+            Some(e) => e,
+            None => return Ok(false),
+        };
 
         let mut found_on_disk = false;
-        for pid in &data_part_ids {
-            if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
-                if part_store::mmap_contains(&part.file_path, value)? {
-                    found_on_disk = true;
-                    break;
-                }
+        for loc in &entry.data_parts {
+            if part_store::mmap_contains(&loc.file_path, value)? {
+                found_on_disk = true;
+                break;
             }
         }
 
@@ -473,13 +463,9 @@ impl InoxSet {
         }
 
         // Check disk deltas.
-        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-        let delta_part_ids = Catalog::txn_get_period_deltas(&pd_table, &cat_key)?;
-        for pid in &delta_part_ids {
-            if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
-                if part_store::mmap_contains(&part.file_path, value)? {
-                    return Ok(false); // tombstoned
-                }
+        for loc in &entry.delta_parts {
+            if part_store::mmap_contains(&loc.file_path, value)? {
+                return Ok(false); // tombstoned
             }
         }
 
@@ -833,6 +819,7 @@ impl InoxSet {
                 .mempart_flushed(data_parts_written, delta_parts_written, total_bytes);
         }
         txn.commit()?;
+        self.rebuild_read_index()?;
         Ok(())
     }
 
@@ -1222,6 +1209,8 @@ impl InoxSet {
         }
         txn.commit()?;
 
+        self.rebuild_read_index()?;
+
         // Delete old part files after commit using the pre-collected paths.
         for path in &old_file_paths {
             if path.exists() {
@@ -1334,6 +1323,7 @@ impl InoxSet {
             }
         }
         txn.commit()?;
+        self.rebuild_read_index()?;
 
         // Delete old files after commit.
         for path in &old_file_paths {
@@ -1509,6 +1499,7 @@ impl InoxSet {
             }
         }
         txn.commit()?;
+        self.rebuild_read_index()?;
 
         // Update stats (subtract new merged part size for net reclamation).
         let old_bytes: u64 = old_parts.iter().map(|p| p.size_bytes).sum();

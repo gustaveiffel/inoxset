@@ -195,12 +195,15 @@ impl InoxSetBuilder {
             })
         });
 
+        // 7. Build read index from catalog.
+        let ridx = crate::read_index::ReadIndex::build(&catalog)?;
+
         Ok(crate::InoxSet {
             path,
             parts_root,
             catalog,
-            // Future: consider arc_swap::ArcSwap for lock-free reads if benchmarks show contention
             writer: RwLock::new(mempart),
+            ridx: arc_swap::ArcSwap::from_pointee(ridx),
             default_granularity: self.default_granularity,
             default_rollup: self.default_rollup,
             metrics: self.metrics,

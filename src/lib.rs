@@ -285,6 +285,22 @@ impl InoxSet {
             return Ok(());
         }
 
+        // Pre-resolve all event configs *before* opening the write transaction
+        // so that auto-registration (which opens its own write txn) does not
+        // deadlock against the flush transaction.
+        let mut event_configs: std::collections::HashMap<String, EventConfig> =
+            std::collections::HashMap::new();
+        for (event, _period) in snapshot.bitmaps.keys() {
+            if !event_configs.contains_key(event.as_str()) {
+                event_configs.insert(event.clone(), self.ensure_event(event)?);
+            }
+        }
+        for (event, _period) in snapshot.deltas.keys() {
+            if !event_configs.contains_key(event.as_str()) {
+                event_configs.insert(event.clone(), self.ensure_event(event)?);
+            }
+        }
+
         // Count total parts needed.
         let total_parts = snapshot.bitmaps.len() + snapshot.deltas.len();
 
@@ -312,7 +328,7 @@ impl InoxSet {
                         context: "ran out of allocated part IDs during flush".to_string(),
                     })?;
 
-                let config = self.ensure_event(event)?;
+                let config = &event_configs[event.as_str()];
                 let file_path = part_store::part_file_path(
                     &self.parts_root,
                     event,
@@ -364,7 +380,7 @@ impl InoxSet {
                         context: "ran out of allocated part IDs during flush".to_string(),
                     })?;
 
-                let config = self.ensure_event(event)?;
+                let config = &event_configs[event.as_str()];
                 let file_path = part_store::part_file_path(
                     &self.parts_root,
                     event,
@@ -515,6 +531,15 @@ impl InoxSet {
     ) -> Result<Vec<(Period, RoaringBitmap)>> {
         self.check_closed()?;
         let periods = Self::enumerate_periods(start, end);
+        // Guard against unbounded ranges that would degrade into a DoS.
+        const MAX_RANGE_PERIODS: usize = 366 * 24; // ~1 year of hours
+        if periods.len() > MAX_RANGE_PERIODS {
+            return Err(InoxSetError::Configuration(format!(
+                "get_range spans {} periods, limit is {}",
+                periods.len(),
+                MAX_RANGE_PERIODS,
+            )));
+        }
         let mut results = Vec::with_capacity(periods.len());
         for p in periods {
             let bm = self.get(event, p)?;
@@ -1012,8 +1037,13 @@ impl InoxSet {
         let event = &representative.event;
         let period = representative.period;
 
+        // Resolve event config before opening the write transaction to avoid
+        // deadlocking if auto-registration triggers its own write txn.
+        let config = self.ensure_event(event)?;
+
         // Allocate new part ID and write merged file.
         let now = self.now_unix();
+        let new_part_size: u64;
         let txn = self.catalog.db().begin_write()?;
         {
             let mut next_id_table = txn.open_table(catalog::NEXT_PART_ID)?;
@@ -1026,8 +1056,6 @@ impl InoxSet {
             let new_id = ids[0];
 
             let max_level = old_parts.iter().map(|p| p.level).max().unwrap_or(0);
-
-            let config = self.ensure_event(event)?;
             let file_path = part_store::part_file_path(
                 &self.parts_root,
                 event,
@@ -1043,6 +1071,7 @@ impl InoxSet {
                 .metadata()
                 .map(|m| m.len())
                 .unwrap_or(merged.serialized_size() as u64);
+            new_part_size = size_bytes;
 
             let part = Part {
                 part_id: new_id,
@@ -1070,8 +1099,9 @@ impl InoxSet {
         }
         txn.commit()?;
 
-        // Update stats.
-        let bytes_reclaimed: u64 = old_parts.iter().map(|p| p.size_bytes).sum();
+        // Update stats (subtract new merged part size for net reclamation).
+        let old_bytes: u64 = old_parts.iter().map(|p| p.size_bytes).sum();
+        let bytes_reclaimed = old_bytes.saturating_sub(new_part_size);
         stats.periods_compacted += 1;
         stats.parts_merged += data_ids.len() as u32;
         stats.deltas_applied += delta_ids.len() as u32;

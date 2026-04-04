@@ -98,25 +98,43 @@ pub fn write_part(path: &Path, bitmap: &RoaringBitmap) -> Result<()> {
         })?;
 
     // Ensure the parent directory hierarchy exists.
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| InoxSetError::BitmapIo {
+    let parent = path.parent().ok_or_else(|| InoxSetError::BitmapIo {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent directory"),
+    })?;
+    fs::create_dir_all(parent).map_err(|e| InoxSetError::BitmapIo {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    // Write to a temporary file, sync, then atomically rename into place.
+    // This prevents partial files from being visible on crash.
+    let tmp_path = path.with_extension("roar.tmp");
+
+    let mut file = fs::File::create(&tmp_path).map_err(|e| InoxSetError::BitmapIo {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    file.write_all(&buf).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        InoxSetError::BitmapIo {
             path: path.to_path_buf(),
             source: e,
-        })?;
-    }
-
-    let mut file = fs::File::create(path).map_err(|e| InoxSetError::BitmapIo {
-        path: path.to_path_buf(),
-        source: e,
+        }
     })?;
 
-    file.write_all(&buf).map_err(|e| InoxSetError::BitmapIo {
-        path: path.to_path_buf(),
-        source: e,
+    // Flush OS buffers to durable storage before rename.
+    file.sync_all().map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        InoxSetError::BitmapIo {
+            path: path.to_path_buf(),
+            source: e,
+        }
     })?;
 
-    // Flush OS buffers to durable storage before reporting success.
-    file.sync_all().map_err(|e| InoxSetError::BitmapIo {
+    // Atomic rename: on Unix this is guaranteed atomic by POSIX.
+    fs::rename(&tmp_path, path).map_err(|e| InoxSetError::BitmapIo {
         path: path.to_path_buf(),
         source: e,
     })?;

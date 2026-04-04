@@ -122,6 +122,8 @@ pub enum InoxSetError {
 /// contains a disallowed character.
 pub fn validate_event_name(name: &str) -> crate::Result<()> {
     if name.is_empty()
+        || name == "."
+        || name == ".."
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'.' || b == b'-')
@@ -159,6 +161,9 @@ mod tests {
         assert!(validate_event_name("foo bar").is_err());
         assert!(validate_event_name("foo/bar").is_err());
         assert!(validate_event_name("foo\0bar").is_err());
+        // Path traversal: "." and ".." must be rejected
+        assert!(validate_event_name(".").is_err());
+        assert!(validate_event_name("..").is_err());
     }
 
     #[test]

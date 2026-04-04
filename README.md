@@ -75,6 +75,22 @@ println!(
 );
 ```
 
+**Dictionary encoding** — store arbitrary string IDs (UUID, nanoid) in u32 Roaring Bitmaps. The mapping is automatic and persistent.
+
+```rust
+// Write with string IDs — dictionary assigns u32 internally
+store.put_ids("premium", Period::Day(2026, 3, 18), &[
+    "usr_9f3a2b-...",
+    "usr_c81d4e-...",
+])?;
+
+// Read back the original string IDs
+let users: Vec<String> = store.get_ids("premium", Period::Day(2026, 3, 18))?;
+
+// GDPR delete by string ID
+store.remove_ids("premium", Period::Day(2026, 3, 18), &["usr_9f3a2b-..."])?;
+```
+
 **Embeddable** — pure Rust, sync API, no runtime dependencies. Drop it into any application.
 
 ```rust
@@ -121,7 +137,10 @@ let result = tokio::task::spawn_blocking(move || {
 | `get_range` | Read multiple periods at once |
 | `cardinality` | Count distinct IDs (O(1) for compacted periods) |
 | `exists` | Check if any data exists for an event + period |
-| `remove_bits` | Delete specific IDs via delta tombstones |
+| `put_ids` | Write external string IDs (auto-mapped to u32 via dictionary) |
+| `get_ids` | Read back external string IDs for an event + period |
+| `remove_ids` | Delete external IDs via dictionary-resolved tombstones |
+| `remove_bits` | Delete specific u32 IDs via delta tombstones |
 | `replace_bitmap` | Atomically replace all data for a period |
 | `bulk_replace` | Replace multiple periods in a single transaction |
 | `flush` | Persist in-memory buffer to disk |

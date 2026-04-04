@@ -150,15 +150,22 @@ impl InoxSet {
             let event_id = event_map[ev];
             let period_id = period_map[period];
 
+            // Merge data parts and subtract delta parts.
+            let mut bm = RoaringBitmap::new();
             for loc in &entry.data_parts {
-                if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
-                    for internal_id in bm.iter() {
-                        if let Ok(Some(ext_id)) =
-                            dict::reverse_lookup(self.catalog.db(), internal_id)
-                        {
-                            builder.add(&ext_id, event_id, period_id);
-                        }
-                    }
+                if let Ok(part_bm) = part_store::mmap_read_part(&loc.file_path) {
+                    bm |= part_bm;
+                }
+            }
+            for loc in &entry.delta_parts {
+                if let Ok(delta_bm) = part_store::mmap_read_part(&loc.file_path) {
+                    bm -= delta_bm;
+                }
+            }
+
+            for internal_id in bm.iter() {
+                if let Ok(Some(ext_id)) = dict::reverse_lookup(self.catalog.db(), internal_id) {
+                    builder.add(&ext_id, event_id, period_id);
                 }
             }
         }
@@ -395,12 +402,13 @@ impl InoxSet {
             // L3: flat array binary search + decode.
             let mut memberships = idx.lookup(external_id);
 
-            // Also check mempart for unflushed data.
+            // Check mempart for unflushed data (including events created after last rebuild).
             {
                 let mp = self.writer.read().map_err(|e| {
                     log::error!("RwLock poisoned: {e}");
                     InoxSetError::Closed
                 })?;
+<<<<<<< HEAD
                 // For unflushed data, we need dict lookups per event.
                 let events = &idx.meta().event_names;
                 for ev in events {
@@ -415,10 +423,40 @@ impl InoxSet {
                                 {
                                     memberships.push((ev.clone(), *period));
                                 }
+=======
+                if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+                    for ((ev_name, period), bm) in &mp.bitmaps {
+                        if bm.contains(internal_id) {
+                            let deltad = mp
+                                .get_delta(ev_name, period)
+                                .is_some_and(|d| d.contains(internal_id));
+                            if !deltad
+                                && !memberships.iter().any(|(e, p)| e == ev_name && p == period)
+                            {
+                                memberships.push((ev_name.clone(), *period));
+>>>>>>> 003e6d8 (fix: code review — mempart delta checks, overflow guard, inverted delta subtraction)
                             }
                         }
                     }
                 }
+<<<<<<< HEAD
+=======
+            }
+
+            // Filter out memberships tombstoned in mempart.
+            if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+                let mp = self.writer.read().map_err(|e| {
+                    log::error!("RwLock poisoned: {e}");
+                    InoxSetError::Closed
+                })?;
+                memberships.retain(|(ev, period)| {
+                    !mp.get_delta(ev, period)
+                        .is_some_and(|d| d.contains(internal_id))
+                });
+            } else {
+                // Dict entry deleted (e.g. by delete_entity) — no memberships.
+                memberships.clear();
+>>>>>>> 003e6d8 (fix: code review — mempart delta checks, overflow guard, inverted delta subtraction)
             }
 
             return Ok(memberships);
@@ -539,6 +577,19 @@ impl InoxSet {
             // Check inverted index for this specific (event, period).
             let found = idx.contains(external_id, event, &period);
             if found {
+                // Check mempart delta — entity may have been tombstoned after last flush.
+                if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+                    let mp = self.writer.read().map_err(|e| {
+                        log::error!("RwLock poisoned: {e}");
+                        InoxSetError::Closed
+                    })?;
+                    if mp
+                        .get_delta(event, &period)
+                        .is_some_and(|d| d.contains(internal_id))
+                    {
+                        return Ok(false); // tombstoned in mempart
+                    }
+                }
                 return Ok(true);
             }
             // Check mempart for unflushed data.
@@ -712,6 +763,44 @@ impl InoxSet {
         self.remove_bits(event, period, &bits)
     }
 
+<<<<<<< HEAD
+=======
+    /// Deletes an entity from all events and periods, then removes
+    /// its dictionary entry.
+    ///
+    /// This is the GDPR erasure operation: after this call, no trace
+    /// of `external_id` remains in the store (bitmaps, dictionary, or
+    /// inverted index).
+    ///
+    /// Returns the number of (event, period) pairs the entity was removed from.
+    ///
+    /// **Note:** The dictionary entry is deleted immediately (durable in redb),
+    /// but bitmap tombstones are written to the mempart and require a
+    /// [`flush`](Self::flush) call to become durable on disk. If the process
+    /// crashes between `delete_entity` and `flush`, the bitmap bits will
+    /// reappear on reopen (though `get_ids` will not resolve them since the
+    /// dict entry is gone).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    pub fn delete_entity(&self, external_id: &str) -> Result<u32> {
+        self.check_writable()?;
+
+        let memberships = self.find_memberships(external_id)?;
+        let count = memberships.len() as u32;
+
+        for (event, period) in &memberships {
+            self.remove_ids(event, *period, &[external_id])?;
+        }
+
+        // Remove dictionary entry.
+        dict::delete(self.catalog.db(), external_id)?;
+
+        Ok(count)
+    }
+
+>>>>>>> 003e6d8 (fix: code review — mempart delta checks, overflow guard, inverted delta subtraction)
     /// Looks up an event by name, auto-registering it with defaults if it
     /// doesn't exist.
     ///

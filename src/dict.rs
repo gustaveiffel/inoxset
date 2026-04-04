@@ -97,9 +97,14 @@ pub fn assign_or_get(db: &Database, external_id: &str) -> crate::Result<u32> {
             id
         } else {
             let next = ctr.get(())?.map(|g| g.value()).unwrap_or(0u32);
+            let next_val = next.checked_add(1).ok_or_else(|| {
+                crate::error::InoxSetError::Configuration(
+                    "global dictionary ID space exhausted (u32::MAX)".into(),
+                )
+            })?;
             fwd.insert(external_id, next)?;
             rev.insert(next, external_id)?;
-            ctr.insert((), next + 1)?;
+            ctr.insert((), next_val)?;
             next
         }
     };
@@ -214,7 +219,11 @@ pub fn batch_assign_or_get(db: &Database, external_ids: &[&str]) -> crate::Resul
                 fwd.insert(ext, next)?;
                 rev.insert(next, ext)?;
                 let assigned = next;
-                next += 1;
+                next = next.checked_add(1).ok_or_else(|| {
+                    crate::error::InoxSetError::Configuration(
+                        "global dictionary ID space exhausted (u32::MAX)".into(),
+                    )
+                })?;
                 assigned
             };
             result[i] = Some(id);

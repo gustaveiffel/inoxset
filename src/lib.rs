@@ -34,6 +34,14 @@ use crate::types::{
     CompactStats, EventConfig, Granularity, Health, Part, PartKind, Period, PeriodState, Rollup,
 };
 
+/// Storage for the inverted index — varies by freshness mode.
+pub(crate) enum InvertedStore {
+    /// No inverted index (Disabled mode).
+    None,
+    /// Frozen index, swapped atomically (OnFlush / OnCompact).
+    Frozen(ArcSwap<inverted::InvertedIndex>),
+}
+
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, error::InoxSetError>;
 
@@ -57,6 +65,9 @@ pub struct InoxSet {
     pub(crate) read_only: bool,
     pub(crate) closed: AtomicBool,
     pub(crate) clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    pub(crate) inverted: InvertedStore,
+    #[allow(dead_code)]
+    pub(crate) index_freshness: types::IndexFreshness,
 }
 
 impl InoxSet {
@@ -87,7 +98,72 @@ impl InoxSet {
     fn rebuild_read_index(&self) -> Result<()> {
         let idx = read_index::ReadIndex::build(&self.catalog)?;
         self.ridx.store(Arc::new(idx));
+        // Rebuild inverted index if freshness mode requires it.
+        // For now, rebuild on any mutation (OnFlush and OnCompact both trigger here).
+        // TODO: differentiate flush vs compact for OnCompact mode.
+        self.rebuild_inverted_index()?;
         Ok(())
+    }
+
+    /// Rebuilds the inverted index from the current ReadIndex + catalog data.
+    fn rebuild_inverted_index(&self) -> Result<()> {
+        match &self.inverted {
+            InvertedStore::None => Ok(()),
+            InvertedStore::Frozen(swap) => {
+                let idx = self.build_frozen_inverted_index()?;
+                swap.store(Arc::new(idx));
+                Ok(())
+            }
+        }
+    }
+
+    /// Scans all bitmaps via ReadIndex, reverse-lookups u32→external_id via dict,
+    /// and builds a frozen InvertedIndex.
+    fn build_frozen_inverted_index(&self) -> Result<inverted::InvertedIndex> {
+        let ridx = self.ridx.load();
+
+        // Collect unique event names and periods, assign compact IDs.
+        let mut event_names: Vec<String> = Vec::new();
+        let mut periods_vec: Vec<Period> = Vec::new();
+        let mut event_map: std::collections::HashMap<String, u16> =
+            std::collections::HashMap::new();
+        let mut period_map: std::collections::HashMap<Period, u16> =
+            std::collections::HashMap::new();
+
+        for (ev, period) in ridx.periods.keys() {
+            if !event_map.contains_key(ev) {
+                let id = event_names.len() as u16;
+                event_names.push(ev.clone());
+                event_map.insert(ev.clone(), id);
+            }
+            if !period_map.contains_key(period) {
+                let id = periods_vec.len() as u16;
+                periods_vec.push(*period);
+                period_map.insert(*period, id);
+            }
+        }
+
+        let mut builder = inverted::InvertedIndexBuilder::new(event_names, periods_vec);
+
+        // For each (event, period), read bitmap, reverse-lookup each u32 → external_id.
+        for ((ev, period), entry) in &ridx.periods {
+            let event_id = event_map[ev];
+            let period_id = period_map[period];
+
+            for loc in &entry.data_parts {
+                if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
+                    for internal_id in bm.iter() {
+                        if let Ok(Some(ext_id)) =
+                            dict::reverse_lookup(self.catalog.db(), ev, internal_id)
+                        {
+                            builder.add(&ext_id, event_id, period_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(builder.build())
     }
 
     /// Returns an error if the store is read-only or closed.

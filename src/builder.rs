@@ -23,7 +23,7 @@ use crate::error::InoxSetError;
 use crate::mempart::MemPart;
 use crate::metrics::{Metrics, NullMetrics};
 use crate::part_store;
-use crate::types::{Granularity, Rollup};
+use crate::types::{Granularity, IndexFreshness, Rollup};
 
 /// Default mempart flush threshold: 16 MiB.
 const DEFAULT_FLUSH_THRESHOLD: u64 = 16 * 1024 * 1024;
@@ -54,6 +54,7 @@ pub struct InoxSetBuilder {
     max_events: usize,
     read_only: bool,
     clock: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
+    index_freshness: IndexFreshness,
 }
 
 impl InoxSetBuilder {
@@ -68,6 +69,7 @@ impl InoxSetBuilder {
             max_events: 0,
             read_only: false,
             clock: None,
+            index_freshness: IndexFreshness::Disabled,
         }
     }
 
@@ -137,6 +139,16 @@ impl InoxSetBuilder {
         self
     }
 
+    /// Sets the freshness strategy for the inverted index.
+    ///
+    /// The inverted index enables sub-microsecond reverse membership lookups
+    /// via [`InoxSet::find_memberships`]. Defaults to [`IndexFreshness::Disabled`]
+    /// (zero RAM overhead, falls back to bitmap scanning).
+    pub fn index_freshness(mut self, freshness: IndexFreshness) -> Self {
+        self.index_freshness = freshness;
+        self
+    }
+
     /// Opens (or creates) the store, returning an [`InoxSet`](crate::InoxSet).
     ///
     /// # Steps performed
@@ -198,6 +210,21 @@ impl InoxSetBuilder {
         // 7. Build read index from catalog.
         let ridx = crate::read_index::ReadIndex::build(&catalog)?;
 
+        // 8. Build InvertedStore based on configured freshness strategy.
+        let inverted = match self.index_freshness {
+            IndexFreshness::Disabled => crate::InvertedStore::None,
+            IndexFreshness::OnFlush | IndexFreshness::OnCompact => {
+                let idx = crate::inverted::InvertedIndex::empty();
+                crate::InvertedStore::Frozen(arc_swap::ArcSwap::from_pointee(idx))
+            }
+            IndexFreshness::Immediate => {
+                log::warn!(
+                    "IndexFreshness::Immediate not yet implemented, falling back to Disabled"
+                );
+                crate::InvertedStore::None
+            }
+        };
+
         Ok(crate::InoxSet {
             path,
             parts_root,
@@ -212,6 +239,8 @@ impl InoxSetBuilder {
             read_only: self.read_only,
             closed: AtomicBool::new(false),
             clock,
+            inverted,
+            index_freshness: self.index_freshness,
         })
     }
 }

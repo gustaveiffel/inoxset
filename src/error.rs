@@ -48,11 +48,6 @@ pub enum InoxSetError {
         source: std::io::Error,
     },
 
-    /// An event name was used that has not been registered and
-    /// auto-registration is disabled.
-    #[error("event not registered and auto-registration disabled: {0}")]
-    UnknownEvent(String),
-
     /// The [`Period`] supplied for a write or query does not match the
     /// [`Granularity`] configured for the event.
     #[error("period {period:?} does not match granularity {expected:?} for event {event}")]
@@ -83,10 +78,6 @@ pub enum InoxSetError {
     /// in the catalog.
     #[error("event already registered: {0}")]
     EventAlreadyRegistered(String),
-
-    /// A write was directed at an event whose period has been dropped.
-    #[error("write to dropped event: {0}")]
-    DroppedEvent(String),
 
     /// The store was opened in read-only mode but a mutating operation was
     /// attempted.

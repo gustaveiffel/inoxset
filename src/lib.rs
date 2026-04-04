@@ -46,6 +46,7 @@ pub struct InoxSet {
     pub(crate) default_rollup: types::Rollup,
     pub(crate) metrics: Arc<dyn metrics::Metrics>,
     pub(crate) flush_threshold: u64,
+    pub(crate) max_events: usize,
     pub(crate) read_only: bool,
     pub(crate) closed: AtomicBool,
     pub(crate) clock: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -176,6 +177,17 @@ impl InoxSet {
 
         if let Some(config) = self.catalog.get_event(name)? {
             return Ok(config);
+        }
+
+        // Enforce max event limit before auto-registering.
+        if self.max_events > 0 {
+            let count = self.catalog.list_events()?.len();
+            if count >= self.max_events {
+                return Err(InoxSetError::Configuration(format!(
+                    "max event limit reached ({}/{})",
+                    count, self.max_events,
+                )));
+            }
         }
 
         // Auto-register with defaults.

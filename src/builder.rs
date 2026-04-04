@@ -42,6 +42,7 @@ const DEFAULT_FLUSH_THRESHOLD: u64 = 16 * 1024 * 1024;
 /// | `default_rollup` | [`Rollup::None`] |
 /// | `metrics` | [`NullMetrics`] (no-op) |
 /// | `mempart_flush_threshold` | 16 MiB |
+/// | `max_events` | 0 (unlimited) |
 /// | `read_only` | `false` |
 /// | `clock` | `SystemTime` UTC seconds |
 pub struct InoxSetBuilder {
@@ -50,6 +51,7 @@ pub struct InoxSetBuilder {
     default_rollup: Rollup,
     metrics: Arc<dyn Metrics>,
     flush_threshold: u64,
+    max_events: usize,
     read_only: bool,
     clock: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
 }
@@ -63,6 +65,7 @@ impl InoxSetBuilder {
             default_rollup: Rollup::None,
             metrics: Arc::new(NullMetrics),
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+            max_events: 0,
             read_only: false,
             clock: None,
         }
@@ -103,6 +106,16 @@ impl InoxSetBuilder {
     /// Defaults to 16 MiB.
     pub fn mempart_flush_threshold(mut self, bytes: u64) -> Self {
         self.flush_threshold = bytes;
+        self
+    }
+
+    /// Sets the maximum number of events allowed in the store.
+    ///
+    /// When set to a non-zero value, auto-registration will fail with
+    /// [`InoxSetError::Configuration`] once the limit is reached.
+    /// Defaults to 0 (unlimited).
+    pub fn max_events(mut self, max: usize) -> Self {
+        self.max_events = max;
         self
     }
 
@@ -192,6 +205,7 @@ impl InoxSetBuilder {
             default_rollup: self.default_rollup,
             metrics: self.metrics,
             flush_threshold: self.flush_threshold,
+            max_events: self.max_events,
             read_only: self.read_only,
             closed: AtomicBool::new(false),
             clock,

@@ -621,69 +621,8 @@ impl Catalog {
     ///
     /// Returns an error on redb I/O failure or data corruption.
     pub fn delete_event(&self, name: &str) -> crate::Result<Vec<u64>> {
-        let txn = self.db.begin_write()?;
-        let mut part_ids: Vec<u64> = Vec::new();
-        {
-            let mut events_table = txn.open_table(EVENTS)?;
-            events_table.remove(name)?;
-
-            let mut pp_table = txn.open_table(PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(PERIOD_STATE)?;
-            let mut parts_table = txn.open_table(PARTS)?;
-
-            let prefix = format!("{}/", name);
-
-            // Collect keys to delete from period_parts, propagating I/O errors.
-            let mut pp_keys: Vec<String> = Vec::new();
-            for item in pp_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value().to_string();
-                if key.starts_with(&prefix) {
-                    pp_keys.push(key);
-                }
-            }
-
-            for key in &pp_keys {
-                if let Some(guard) = pp_table.remove(key.as_str())? {
-                    let ids = deserialize_u64_vec(key, guard.value())?;
-                    part_ids.extend(ids);
-                }
-            }
-
-            // Collect and delete keys from period_deltas, propagating I/O errors.
-            let mut pd_keys: Vec<String> = Vec::new();
-            for item in pd_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value().to_string();
-                if key.starts_with(&prefix) {
-                    pd_keys.push(key);
-                }
-            }
-            for key in &pd_keys {
-                pd_table.remove(key.as_str())?;
-            }
-
-            // Collect and delete keys from period_state, propagating I/O errors.
-            let mut ps_keys: Vec<String> = Vec::new();
-            for item in ps_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value().to_string();
-                if key.starts_with(&prefix) {
-                    ps_keys.push(key);
-                }
-            }
-            for key in &ps_keys {
-                ps_table.remove(key.as_str())?;
-            }
-
-            // Remove the PARTS entries for every part_id collected above.
-            for &pid in &part_ids {
-                parts_table.remove(pid)?;
-            }
-        }
-        txn.commit()?;
-        Ok(part_ids)
+        let parts = self.delete_event_returning_parts(name)?;
+        Ok(parts.into_iter().map(|p| p.part_id).collect())
     }
 
     /// Deletes an event and all associated period and part metadata in a single
@@ -1343,6 +1282,19 @@ mod tests {
             .unwrap();
         cat.append_period_parts("active/hour/2026-03-11T14", &[1])
             .unwrap();
+        // Register the Part so delete_event_returning_parts can resolve it.
+        let part = Part {
+            part_id: 1,
+            kind: PartKind::Data,
+            event: "active".into(),
+            period: Period::Hour(2026, 3, 11, 14),
+            file_path: "active/hour/2026-03-11T14.000000000001.roar".into(),
+            size_bytes: 512,
+            cardinality: 100,
+            created_at: 1000,
+            level: 0,
+        };
+        cat.register_part(&part).unwrap();
 
         let deleted_part_ids = cat.delete_event("active").unwrap();
         assert_eq!(deleted_part_ids, vec![1]);

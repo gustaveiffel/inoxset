@@ -608,3 +608,97 @@ fn dict_compaction_preserves_dictionary() {
     sorted.sort();
     assert_eq!(sorted, vec!["x", "y"]);
 }
+
+// --- Inverted Index Integration Tests ---
+
+#[test]
+fn inverted_index_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("data");
+    {
+        let store = InoxSet::builder()
+            .path(&path)
+            .index_freshness(inoxset::types::IndexFreshness::OnFlush)
+            .open()
+            .unwrap();
+        store
+            .put_ids("seg", Period::Day(2026, 4, 1), &["alice", "bob"])
+            .unwrap();
+        store.flush().unwrap();
+        let m = store.find_memberships("alice").unwrap();
+        assert_eq!(m.len(), 1);
+        store.close().unwrap();
+    }
+    {
+        let store = InoxSet::builder()
+            .path(&path)
+            .index_freshness(inoxset::types::IndexFreshness::OnFlush)
+            .open()
+            .unwrap();
+        // Write a new period to trigger index rebuild
+        store
+            .put_ids("seg2", Period::Day(2026, 4, 2), &["alice"])
+            .unwrap();
+        store.flush().unwrap();
+        // Verify the persisted data is still queryable via index
+        let m = store.find_memberships("alice").unwrap();
+        assert_eq!(m.len(), 2); // alice in seg (2026-4-1) and seg2 (2026-4-2)
+        assert!(store.find_memberships("unknown").unwrap().is_empty());
+    }
+}
+
+#[test]
+fn inverted_index_disabled_fallback() {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+    store
+        .put_ids("seg", Period::Day(2026, 4, 1), &["alice"])
+        .unwrap();
+    store.flush().unwrap();
+    let m = store.find_memberships("alice").unwrap();
+    assert_eq!(m.len(), 1);
+}
+
+#[test]
+fn inverted_index_delete_period_rebuilds() {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .index_freshness(inoxset::types::IndexFreshness::OnFlush)
+        .open()
+        .unwrap();
+    store
+        .put_ids("seg", Period::Day(2026, 4, 1), &["alice"])
+        .unwrap();
+    store
+        .put_ids("seg", Period::Day(2026, 4, 2), &["alice"])
+        .unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.find_memberships("alice").unwrap().len(), 2);
+    store.delete_period("seg", Period::Day(2026, 4, 1)).unwrap();
+    assert_eq!(store.find_memberships("alice").unwrap().len(), 1);
+}
+
+#[test]
+fn inverted_index_compaction_preserves() {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .index_freshness(inoxset::types::IndexFreshness::OnFlush)
+        .open()
+        .unwrap();
+    store
+        .put_ids("seg", Period::Day(2026, 4, 1), &["alice"])
+        .unwrap();
+    store.flush().unwrap();
+    store
+        .put_ids("seg", Period::Day(2026, 4, 1), &["bob"])
+        .unwrap();
+    store.flush().unwrap();
+    store.compact().unwrap();
+    assert_eq!(store.find_memberships("alice").unwrap().len(), 1);
+    assert_eq!(store.find_memberships("bob").unwrap().len(), 1);
+}

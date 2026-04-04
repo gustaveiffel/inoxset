@@ -5,6 +5,7 @@
 
 pub mod builder;
 pub mod catalog;
+pub mod dict;
 pub mod error;
 pub mod mempart;
 pub mod merge;

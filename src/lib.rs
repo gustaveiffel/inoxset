@@ -134,6 +134,32 @@ impl InoxSet {
         self.catalog.list_events()
     }
 
+    /// Returns the list of periods that contain data for the given event.
+    ///
+    /// This includes periods with data parts, delta parts, or both in the
+    /// catalog. In-memory (unflushed) periods are not included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog I/O failure.
+    pub fn list_periods(&self, event: &str) -> Result<Vec<Period>> {
+        self.check_closed()?;
+        validate_event_name(event)?;
+        let keys = self.catalog.period_keys_for_event(event)?;
+        // Catalog keys have the form "event/gran/period_key".
+        // Extract the period_key (3rd segment) and parse it.
+        let mut periods: Vec<Period> = keys
+            .iter()
+            .filter_map(|k| {
+                let period_key = k.splitn(3, '/').nth(2)?;
+                period::parse_period_key(period_key)
+            })
+            .collect();
+        periods.sort();
+        periods.dedup();
+        Ok(periods)
+    }
+
     /// Drops an event and all its associated data (periods, parts, deltas).
     ///
     /// On-disk part files referenced by the event are deleted after the catalog
@@ -1899,6 +1925,39 @@ mod tests {
         assert!(
             result.is_err(),
             "get() should fail when part file is missing"
+        );
+    }
+
+    #[test]
+    fn list_periods_returns_flushed_periods() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+
+        store
+            .put_bitmap("clicks", Period::Day(2026, 3, 10), bm.clone())
+            .unwrap();
+        store
+            .put_bitmap("clicks", Period::Day(2026, 3, 11), bm.clone())
+            .unwrap();
+        store
+            .put_bitmap("clicks", Period::Day(2026, 3, 12), bm)
+            .unwrap();
+        store.flush().unwrap();
+
+        let periods = store.list_periods("clicks").unwrap();
+        assert_eq!(
+            periods,
+            vec![
+                Period::Day(2026, 3, 10),
+                Period::Day(2026, 3, 11),
+                Period::Day(2026, 3, 12),
+            ]
         );
     }
 }

@@ -101,6 +101,63 @@ impl Period {
     }
 }
 
+/// Parses a period key string back into a [`Period`].
+///
+/// Inverse of [`Period::key`].  Returns `None` when the string does not
+/// match any known format.
+///
+/// | Input | Result |
+/// |-------|--------|
+/// | `"_static"` | `Some(Period::Static)` |
+/// | `"2026-03-11T14"` | `Some(Period::Hour(2026,3,11,14))` |
+/// | `"2026-03-11"` | `Some(Period::Day(2026,3,11))` |
+/// | `"2026-03"` | `Some(Period::Month(2026,3))` |
+/// | `"2026"` | `Some(Period::Year(2026))` |
+pub fn parse_period_key(s: &str) -> Option<Period> {
+    if s == "_static" {
+        return Some(Period::Static);
+    }
+    let bytes = s.as_bytes();
+    match bytes.len() {
+        // "YYYY" → Year
+        4 => {
+            let y = s.parse::<u16>().ok()?;
+            Some(Period::Year(y))
+        }
+        // "YYYY-MM" → Month
+        7 if bytes[4] == b'-' => {
+            let y = s[..4].parse::<u16>().ok()?;
+            let m = s[5..7].parse::<u8>().ok()?;
+            if !(1..=12).contains(&m) {
+                return None;
+            }
+            Some(Period::Month(y, m))
+        }
+        // "YYYY-MM-DD" → Day
+        10 if bytes[4] == b'-' && bytes[7] == b'-' => {
+            let y = s[..4].parse::<u16>().ok()?;
+            let m = s[5..7].parse::<u8>().ok()?;
+            let d = s[8..10].parse::<u8>().ok()?;
+            if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+                return None;
+            }
+            Some(Period::Day(y, m, d))
+        }
+        // "YYYY-MM-DDTHH" → Hour
+        13 if bytes[4] == b'-' && bytes[7] == b'-' && bytes[10] == b'T' => {
+            let y = s[..4].parse::<u16>().ok()?;
+            let m = s[5..7].parse::<u8>().ok()?;
+            let d = s[8..10].parse::<u8>().ok()?;
+            let h = s[11..13].parse::<u8>().ok()?;
+            if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 {
+                return None;
+            }
+            Some(Period::Hour(y, m, d, h))
+        }
+        _ => None,
+    }
+}
+
 /// Iterator over ancestor [`Period`]s, from immediate parent up to
 /// [`Period::Year`].
 ///
@@ -325,5 +382,30 @@ mod tests {
         let now_2026 = 1_773_500_000;
         assert!(Period::Year(2025).is_closed(now_2026));
         assert!(!Period::Year(2026).is_closed(now_2026));
+    }
+
+    #[test]
+    fn parse_period_key_roundtrip() {
+        let cases = vec![
+            Period::Static,
+            Period::Hour(2026, 3, 11, 14),
+            Period::Day(2026, 3, 11),
+            Period::Month(2026, 3),
+            Period::Year(2026),
+        ];
+        for p in cases {
+            let key = p.key();
+            let parsed = super::parse_period_key(&key);
+            assert_eq!(parsed, Some(p), "failed roundtrip for key: {key}");
+        }
+    }
+
+    #[test]
+    fn parse_period_key_invalid() {
+        assert_eq!(super::parse_period_key(""), None);
+        assert_eq!(super::parse_period_key("garbage"), None);
+        assert_eq!(super::parse_period_key("2026-13"), None); // bad month
+        assert_eq!(super::parse_period_key("2026-03-32"), None); // bad day
+        assert_eq!(super::parse_period_key("2026-03-11T25"), None); // bad hour
     }
 }

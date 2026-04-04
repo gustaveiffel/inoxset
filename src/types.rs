@@ -67,7 +67,7 @@ impl Granularity {
 ///
 /// Each variant encodes the fields needed to locate data on disk.  `Static` is
 /// used for time-independent sets (e.g. geo lookups).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Period {
     /// Time-independent set; stored once with no rollup.
     Static,

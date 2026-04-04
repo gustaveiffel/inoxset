@@ -126,7 +126,31 @@ let result = tokio::task::spawn_blocking(move || {
 | `bulk_replace` | Replace multiple periods in a single transaction |
 | `flush` | Persist in-memory buffer to disk |
 | `compact` | Merge parts and apply deletes |
+| `list_periods` | Discover which periods contain data for an event |
 | `health` | Operational health snapshot |
+
+## Using with async runtimes
+
+inoxset uses synchronous I/O (redb transactions, mmap page faults). In a tokio or async-std context, wrap calls with `spawn_blocking`:
+
+```rust
+let store = Arc::new(store);
+
+// Read path
+let s = store.clone();
+let bm = tokio::task::spawn_blocking(move || {
+    s.get("active", Period::Day(2026, 3, 18))
+}).await??;
+
+// Write path
+let s = store.clone();
+tokio::task::spawn_blocking(move || {
+    s.put_bitmap("active", Period::Day(2026, 3, 18), bitmap)?;
+    s.flush()
+}).await??;
+```
+
+`InoxSet` is `Send + Sync` — safe to share via `Arc` across tasks. Reads acquire a shared lock and do not block other reads.
 
 ## Installation
 

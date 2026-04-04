@@ -384,6 +384,44 @@ fn bench_find_memberships(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_find_memberships_inverted(c: &mut Criterion) {
+    let mut group = c.benchmark_group("find_memberships_inverted");
+
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .index_freshness(inoxset::types::IndexFreshness::OnFlush)
+        .open()
+        .unwrap();
+
+    let ids: Vec<String> = (0..10_000).map(|i| format!("usr-{i:08}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+    for seg in 0..20 {
+        for d in 1..=30u8 {
+            store
+                .put_ids(&format!("seg_{seg}"), Period::Day(2026, 4, d), &id_refs)
+                .unwrap();
+        }
+    }
+    store.flush().unwrap();
+    store.compact().unwrap();
+
+    group.bench_function("hit_all_600", |b| {
+        b.iter(|| {
+            black_box(store.find_memberships("usr-00005000").unwrap());
+        })
+    });
+
+    group.bench_function("miss", |b| {
+        b.iter(|| {
+            black_box(store.find_memberships("unknown-user").unwrap());
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_put_bitmap,
@@ -397,6 +435,7 @@ criterion_group!(
     bench_dict_assign_throughput,
     bench_contains_id,
     bench_find_memberships,
+    bench_find_memberships_inverted,
     bench_redb_txn_baseline,
 );
 criterion_main!(benches);

@@ -152,6 +152,25 @@ tokio::task::spawn_blocking(move || {
 
 `InoxSet` is `Send + Sync` — safe to share via `Arc` across tasks. Reads acquire a shared lock and do not block other reads.
 
+## Benchmarks
+
+Measured with [Criterion](https://github.com/bheisler/criterion.rs) on Apple M-series, single thread. Median values.
+
+| Operation | Scenario | Median |
+|-----------|----------|--------|
+| `put_bitmap` | 1K bits | **4.1 µs** |
+| `put_bitmap` | 1K bits + rollup auto | **10.7 µs** |
+| `get` | 1 part (mmap) | **29.6 µs** |
+| `get` | 5 parts merged | **119.9 µs** |
+| `get` | 20 parts merged | **468 µs** |
+| `get` | compacted, 100K bits | **28.0 µs** |
+| `flush` | 10 events x 100 periods | **321 ms** |
+| `compact` | 50 periods x 5 parts | **231 ms** |
+
+Baseline redb overhead: write txn commit ~2.6 ms, read txn open ~659 ns.
+
+Run your own: `cargo bench`
+
 ## Installation
 
 Add to your `Cargo.toml`:

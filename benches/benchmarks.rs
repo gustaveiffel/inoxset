@@ -286,6 +286,104 @@ fn bench_dict_assign_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_contains_id(c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+
+    // Seed: 1 event, 1 period, 10K IDs (compacted).
+    let ids: Vec<String> = (0..10_000).map(|i| format!("usr-{i:08}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    store
+        .put_ids("segment", Period::Day(2026, 4, 1), &id_refs)
+        .unwrap();
+    store.flush().unwrap();
+    store.compact().unwrap();
+
+    c.bench_function("contains_id/1ev_1period_10K", |b| {
+        b.iter(|| {
+            black_box(
+                store
+                    .contains_id("segment", Period::Day(2026, 4, 1), "usr-00005000")
+                    .unwrap(),
+            );
+        })
+    });
+}
+
+fn bench_find_memberships(c: &mut Criterion) {
+    let mut group = c.benchmark_group("find_memberships");
+
+    // Scenario: 5 segments × 7 days, 10K users each, compacted.
+    {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let ids: Vec<String> = (0..10_000).map(|i| format!("usr-{i:08}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+        for seg in 0..5 {
+            for d in 1..=7u8 {
+                store
+                    .put_ids(&format!("seg_{seg}"), Period::Day(2026, 4, d), &id_refs)
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        store.compact().unwrap();
+
+        // User present in all 35 event×period combos.
+        group.bench_function("5seg_7days_hit_all", |b| {
+            b.iter(|| {
+                black_box(store.find_memberships("usr-00005000").unwrap());
+            })
+        });
+
+        // User not in dictionary at all.
+        group.bench_function("5seg_7days_miss", |b| {
+            b.iter(|| {
+                black_box(store.find_memberships("unknown-user").unwrap());
+            })
+        });
+    }
+
+    // Scenario: 20 segments × 30 days, 10K users, compacted.
+    {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let ids: Vec<String> = (0..10_000).map(|i| format!("usr-{i:08}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+        for seg in 0..20 {
+            for d in 1..=30u8 {
+                store
+                    .put_ids(&format!("seg_{seg}"), Period::Day(2026, 4, d), &id_refs)
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        store.compact().unwrap();
+
+        // 600 event×period combos to check.
+        group.bench_function("20seg_30days_hit_all", |b| {
+            b.iter(|| {
+                black_box(store.find_memberships("usr-00005000").unwrap());
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_put_bitmap,
@@ -297,6 +395,8 @@ criterion_group!(
     bench_put_ids,
     bench_get_ids,
     bench_dict_assign_throughput,
+    bench_contains_id,
+    bench_find_memberships,
     bench_redb_txn_baseline,
 );
 criterion_main!(benches);

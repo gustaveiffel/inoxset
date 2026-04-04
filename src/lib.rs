@@ -268,6 +268,59 @@ impl InoxSet {
         Ok(deleted)
     }
 
+    /// Finds all `(event, period)` pairs where the given external ID is present.
+    ///
+    /// Resolves the external ID through the dictionary, then checks membership
+    /// across all events and periods. Returns an empty vec if the ID has never
+    /// been assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn find_memberships(&self, external_id: &str) -> Result<Vec<(String, Period)>> {
+        self.check_closed()?;
+
+        let events = self.list_events()?;
+        let mut memberships = Vec::new();
+
+        for ev in &events {
+            // Resolve the external ID in this event's dictionary scope.
+            let internal_id = match dict::lookup(self.catalog.db(), &ev.name, external_id)? {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let periods = self.list_periods(&ev.name)?;
+            for period in periods {
+                let bitmap = self.get(&ev.name, period)?;
+                if bitmap.contains(internal_id) {
+                    memberships.push((ev.name.clone(), period));
+                }
+            }
+        }
+
+        Ok(memberships)
+    }
+
+    /// Checks whether an external ID is present in a specific event and period.
+    ///
+    /// More efficient than [`find_memberships`](Self::find_memberships) when
+    /// checking a single event/period. Avoids full bitmap deserialization if
+    /// the event/ID is not in the dictionary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn contains_id(&self, event: &str, period: Period, external_id: &str) -> Result<bool> {
+        self.check_closed()?;
+        let internal_id = match dict::lookup(self.catalog.db(), event, external_id)? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let bitmap = self.get(event, period)?;
+        Ok(bitmap.contains(internal_id))
+    }
+
     /// Writes a set of external IDs for the given event and period.
     ///
     /// External IDs (strings) are transparently mapped to u32 values via

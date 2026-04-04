@@ -8,6 +8,7 @@ pub mod builder;
 pub mod catalog;
 pub mod dict;
 pub mod error;
+pub(crate) mod inverted;
 pub mod mempart;
 pub mod merge;
 pub mod metrics;

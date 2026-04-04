@@ -280,5 +280,191 @@ fn bench_intersection(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(comparison, bench_write_1k, bench_read, bench_intersection,);
+// ── Membership: "is user X in segment Y on day Z?" ──────────────────────────
+
+fn bench_membership(c: &mut Criterion) {
+    let mut group = c.benchmark_group("membership");
+
+    // ── Single check: 1 event, 1 period, 10K users ──
+
+    // inoxset: contains_id
+    {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let ids: Vec<String> = (0..10_000).map(|i| format!("usr-{i:08}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        store
+            .put_ids("segment", Period::Day(2026, 4, 1), &id_refs)
+            .unwrap();
+        store.flush().unwrap();
+        store.compact().unwrap();
+
+        group.bench_function("inoxset/contains_id", |b| {
+            b.iter(|| {
+                black_box(
+                    store
+                        .contains_id("segment", Period::Day(2026, 4, 1), "usr-00005000")
+                        .unwrap(),
+                );
+            })
+        });
+    }
+
+    // Redis: GETBIT
+    if let Some(mut con) = redis_client(6379) {
+        let _: () = redis::cmd("DEL")
+            .arg("membership:seg:2026-04-01")
+            .query(&mut con)
+            .unwrap();
+        {
+            let mut pipe = redis::pipe();
+            for i in 0..10_000u32 {
+                pipe.cmd("SETBIT")
+                    .arg("membership:seg:2026-04-01")
+                    .arg(i)
+                    .arg(1)
+                    .ignore();
+            }
+            let _: () = pipe.query(&mut con).unwrap();
+        }
+
+        group.bench_function("redis/getbit", |b| {
+            b.iter(|| {
+                let v: u32 = redis::cmd("GETBIT")
+                    .arg("membership:seg:2026-04-01")
+                    .arg(5000)
+                    .query(&mut con)
+                    .unwrap();
+                black_box(v);
+            })
+        });
+    }
+
+    // bitmapist-server: GETBIT
+    if let Some(mut con) = redis_client(6380) {
+        {
+            let mut pipe = redis::pipe();
+            for i in 0..10_000u32 {
+                pipe.cmd("SETBIT")
+                    .arg("membership:seg:2026-04-01")
+                    .arg(i)
+                    .arg(1)
+                    .ignore();
+            }
+            let _: () = pipe.query(&mut con).unwrap();
+        }
+
+        group.bench_function("bitmapist/getbit", |b| {
+            b.iter(|| {
+                let v: u32 = redis::cmd("GETBIT")
+                    .arg("membership:seg:2026-04-01")
+                    .arg(5000)
+                    .query(&mut con)
+                    .unwrap();
+                black_box(v);
+            })
+        });
+    }
+
+    // ── Multi check: scan 20 segments × 30 days ──
+
+    // inoxset: find_memberships
+    {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let ids: Vec<String> = (0..10_000).map(|i| format!("usr-{i:08}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+        for seg in 0..20 {
+            for d in 1..=30u8 {
+                store
+                    .put_ids(&format!("seg_{seg}"), Period::Day(2026, 4, d), &id_refs)
+                    .unwrap();
+            }
+        }
+        store.flush().unwrap();
+        store.compact().unwrap();
+
+        group.bench_function("inoxset/find_memberships_600", |b| {
+            b.iter(|| {
+                black_box(store.find_memberships("usr-00005000").unwrap());
+            })
+        });
+    }
+
+    // Redis: GETBIT × 600 (pipelined)
+    if let Some(mut con) = redis_client(6379) {
+        // Seed 600 keys.
+        for seg in 0..20 {
+            let mut pipe = redis::pipe();
+            for d in 1..=30u8 {
+                let key = format!("find:seg_{seg}:2026-04-{d:02}");
+                for i in 0..10_000u32 {
+                    pipe.cmd("SETBIT").arg(&key).arg(i).arg(1).ignore();
+                }
+            }
+            let _: () = pipe.query(&mut con).unwrap();
+        }
+
+        group.bench_function("redis/getbit_pipeline_600", |b| {
+            b.iter(|| {
+                let mut pipe = redis::pipe();
+                for seg in 0..20 {
+                    for d in 1..=30u8 {
+                        let key = format!("find:seg_{seg}:2026-04-{d:02}");
+                        pipe.cmd("GETBIT").arg(key).arg(5000);
+                    }
+                }
+                let results: Vec<u32> = pipe.query(&mut con).unwrap();
+                black_box(results);
+            })
+        });
+    }
+
+    // bitmapist-server: GETBIT × 600 (pipelined)
+    if let Some(mut con) = redis_client(6380) {
+        for seg in 0..20 {
+            let mut pipe = redis::pipe();
+            for d in 1..=30u8 {
+                let key = format!("find:seg_{seg}:2026-04-{d:02}");
+                for i in 0..10_000u32 {
+                    pipe.cmd("SETBIT").arg(&key).arg(i).arg(1).ignore();
+                }
+            }
+            let _: () = pipe.query(&mut con).unwrap();
+        }
+
+        group.bench_function("bitmapist/getbit_pipeline_600", |b| {
+            b.iter(|| {
+                let mut pipe = redis::pipe();
+                for seg in 0..20 {
+                    for d in 1..=30u8 {
+                        let key = format!("find:seg_{seg}:2026-04-{d:02}");
+                        pipe.cmd("GETBIT").arg(key).arg(5000);
+                    }
+                }
+                let results: Vec<u32> = pipe.query(&mut con).unwrap();
+                black_box(results);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    comparison,
+    bench_write_1k,
+    bench_read,
+    bench_intersection,
+    bench_membership,
+);
 criterion_main!(comparison);

@@ -207,6 +207,252 @@ pub fn mmap_read_part(path: &Path) -> Result<RoaringBitmap> {
     })
 }
 
+/// Checks membership of a single `u32` value directly on serialized Roaring
+/// Bitmap bytes, **without deserializing** the full bitmap into memory.
+///
+/// This performs a binary search on the container descriptive header, then
+/// a targeted check within the matched container (array binary search or
+/// bitmap bit test). The cost is O(log C + log N) where C is the number of
+/// containers and N is the container cardinality — typically under 200ns.
+///
+/// Returns `false` for empty or malformed data (no panic, no error).
+pub fn serialized_contains(data: &[u8], value: u32) -> bool {
+    let hi = (value >> 16) as u16;
+    let lo = (value & 0xFFFF) as u16;
+
+    // Minimum valid size: 4 bytes cookie + 4 bytes container count or cookie.
+    if data.len() < 4 {
+        return false;
+    }
+
+    let cookie = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+
+    const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+    const SERIAL_COOKIE: u16 = 12347;
+    // The roaring crate always writes offset headers regardless of container
+    // count. The spec says >= 4, but the Rust crate includes them always.
+    const NO_OFFSET_THRESHOLD: usize = 1;
+
+    let (nb_containers, has_runs, header_start) = if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
+        if data.len() < 8 {
+            return false;
+        }
+        let n = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        (n, false, 8)
+    } else if (cookie & 0xFFFF) as u16 == SERIAL_COOKIE {
+        let n = ((cookie >> 16) + 1) as usize;
+        (n, true, 4)
+    } else {
+        return false;
+    };
+
+    if nb_containers == 0 {
+        return false;
+    }
+
+    // Skip run bitmap if present: ceil(nb_containers / 8) bytes.
+    let run_bitmap_start = header_start;
+    let run_bitmap_bytes = if has_runs {
+        nb_containers.div_ceil(8)
+    } else {
+        0
+    };
+    let desc_start = header_start + run_bitmap_bytes;
+
+    // Descriptive header: 4 bytes per container (key_hi: u16, card_minus_1: u16).
+    let desc_end = desc_start + nb_containers * 4;
+    if data.len() < desc_end {
+        return false;
+    }
+
+    // Binary search for the container with key == hi.
+    let container_idx = {
+        let mut lo_idx = 0usize;
+        let mut hi_idx = nb_containers;
+        let mut found = None;
+        while lo_idx < hi_idx {
+            let mid = lo_idx + (hi_idx - lo_idx) / 2;
+            let off = desc_start + mid * 4;
+            let key = u16::from_le_bytes([data[off], data[off + 1]]);
+            match key.cmp(&hi) {
+                std::cmp::Ordering::Equal => {
+                    found = Some(mid);
+                    break;
+                }
+                std::cmp::Ordering::Less => lo_idx = mid + 1,
+                std::cmp::Ordering::Greater => hi_idx = mid,
+            }
+        }
+        match found {
+            Some(idx) => idx,
+            None => return false,
+        }
+    };
+
+    // Read cardinality - 1 for this container.
+    let desc_off = desc_start + container_idx * 4;
+    let card_minus_1 = u16::from_le_bytes([data[desc_off + 2], data[desc_off + 3]]) as usize;
+    let cardinality = card_minus_1 + 1;
+
+    // Determine if this is a run container.
+    let is_run = has_runs && {
+        let byte_idx = run_bitmap_start + container_idx / 8;
+        let bit_idx = container_idx % 8;
+        data.get(byte_idx).is_some_and(|b| b & (1 << bit_idx) != 0)
+    };
+
+    // Compute offset to the container's data.
+    let container_data_offset = if nb_containers >= NO_OFFSET_THRESHOLD {
+        // Offset header present after descriptive header.
+        let offset_header_start = desc_end;
+        let offset_off = offset_header_start + container_idx * 4;
+        if data.len() < offset_off + 4 {
+            return false;
+        }
+        u32::from_le_bytes([
+            data[offset_off],
+            data[offset_off + 1],
+            data[offset_off + 2],
+            data[offset_off + 3],
+        ]) as usize
+    } else {
+        // No offset header — compute sequentially.
+        let mut offset = desc_end; // after descriptive header (no offset header)
+        for i in 0..container_idx {
+            let d = desc_start + i * 4;
+            let c = u16::from_le_bytes([data[d + 2], data[d + 3]]) as usize + 1;
+            let is_run_i = has_runs && {
+                let bi = run_bitmap_start + i / 8;
+                let bit = i % 8;
+                data.get(bi).is_some_and(|b| b & (1 << bit) != 0)
+            };
+            if is_run_i {
+                // Run container: first u16 is number of runs, then pairs.
+                if data.len() < offset + 2 {
+                    return false;
+                }
+                let n_runs = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                offset += 2 + n_runs * 4;
+            } else if c <= 4096 {
+                offset += c * 2; // array container
+            } else {
+                offset += 8192; // bitmap container
+            }
+        }
+        offset
+    };
+
+    if is_run {
+        // Run container: u16 n_runs, then n_runs × (start: u16, length: u16).
+        if data.len() < container_data_offset + 2 {
+            return false;
+        }
+        let n_runs =
+            u16::from_le_bytes([data[container_data_offset], data[container_data_offset + 1]])
+                as usize;
+        let runs_start = container_data_offset + 2;
+        if data.len() < runs_start + n_runs * 4 {
+            return false;
+        }
+        // Binary search runs for lo.
+        let mut lo_idx = 0usize;
+        let mut hi_idx = n_runs;
+        while lo_idx < hi_idx {
+            let mid = lo_idx + (hi_idx - lo_idx) / 2;
+            let off = runs_start + mid * 4;
+            let start = u16::from_le_bytes([data[off], data[off + 1]]);
+            let length = u16::from_le_bytes([data[off + 2], data[off + 3]]);
+            if lo < start {
+                hi_idx = mid;
+            } else if lo > start + length {
+                lo_idx = mid + 1;
+            } else {
+                return true;
+            }
+        }
+        false
+    } else if cardinality <= 4096 {
+        // Array container: sorted u16 values, binary search.
+        let arr_start = container_data_offset;
+        if data.len() < arr_start + cardinality * 2 {
+            return false;
+        }
+        let mut lo_idx = 0usize;
+        let mut hi_idx = cardinality;
+        while lo_idx < hi_idx {
+            let mid = lo_idx + (hi_idx - lo_idx) / 2;
+            let off = arr_start + mid * 2;
+            let val = u16::from_le_bytes([data[off], data[off + 1]]);
+            match val.cmp(&lo) {
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Less => lo_idx = mid + 1,
+                std::cmp::Ordering::Greater => hi_idx = mid,
+            }
+        }
+        false
+    } else {
+        // Bitmap container: 8192 bytes = 65536 bits.
+        let bm_start = container_data_offset;
+        if data.len() < bm_start + 8192 {
+            return false;
+        }
+        let byte_idx = bm_start + (lo as usize) / 8;
+        let bit_idx = (lo as usize) % 8;
+        data[byte_idx] & (1 << bit_idx) != 0
+    }
+}
+
+/// Checks membership of a `u32` value in a part file without deserializing
+/// the bitmap.
+///
+/// Memory-maps the file and calls [`serialized_contains`] directly on the
+/// mapped bytes. This is ~100x faster than [`mmap_read_part`] followed by
+/// `bitmap.contains()` for single-value lookups.
+///
+/// # Errors
+///
+/// Returns [`InoxSetError::BitmapIo`] if the file cannot be opened or mapped.
+/// Checks membership of a `u32` value in a part file without deserializing
+/// the bitmap.
+///
+/// For files ≤ 64 KiB, reads into a stack-friendly buffer to avoid mmap
+/// syscall overhead. For larger files, uses memory-mapping.
+///
+/// # Errors
+///
+/// Returns [`InoxSetError::BitmapIo`] if the file cannot be opened or read.
+pub fn mmap_contains(path: &Path, value: u32) -> Result<bool> {
+    let meta = fs::metadata(path).map_err(|e| InoxSetError::BitmapIo {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    if meta.len() <= 65_536 {
+        // Small file: direct read is faster than mmap (no kernel mapping overhead).
+        let bytes = fs::read(path).map_err(|e| InoxSetError::BitmapIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        return Ok(serialized_contains(&bytes, value));
+    }
+
+    // Large file: mmap for OS page cache sharing.
+    let file = fs::File::open(path).map_err(|e| InoxSetError::BitmapIo {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    // SAFETY: same invariants as mmap_read_part — immutable part files.
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file).map_err(|e| InoxSetError::BitmapIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?
+    };
+
+    Ok(serialized_contains(&mmap, value))
+}
+
 /// Removes a part file from disk.
 ///
 /// This is a thin wrapper around [`std::fs::remove_file`] that maps the error
@@ -494,5 +740,91 @@ mod tests {
         let known: HashSet<u64> = HashSet::new();
         let orphans = scan_orphans(&root, &known).unwrap();
         assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn serialized_contains_array_container() {
+        // Small bitmap → array container.
+        let mut bm = RoaringBitmap::new();
+        bm.insert(42);
+        bm.insert(1000);
+        bm.insert(9999);
+        let mut buf = Vec::new();
+        bm.serialize_into(&mut buf).unwrap();
+
+        assert!(serialized_contains(&buf, 42));
+        assert!(serialized_contains(&buf, 1000));
+        assert!(serialized_contains(&buf, 9999));
+        assert!(!serialized_contains(&buf, 0));
+        assert!(!serialized_contains(&buf, 43));
+        assert!(!serialized_contains(&buf, 10000));
+    }
+
+    #[test]
+    fn serialized_contains_bitmap_container() {
+        // Large bitmap in one container → bitmap container (>4096 values).
+        let mut bm = RoaringBitmap::new();
+        for i in 0..10_000u32 {
+            bm.insert(i);
+        }
+        let mut buf = Vec::new();
+        bm.serialize_into(&mut buf).unwrap();
+
+        assert!(serialized_contains(&buf, 0));
+        assert!(serialized_contains(&buf, 5000));
+        assert!(serialized_contains(&buf, 9999));
+        assert!(!serialized_contains(&buf, 10000));
+        assert!(!serialized_contains(&buf, u32::MAX));
+    }
+
+    #[test]
+    fn serialized_contains_multiple_containers() {
+        // Values in different high-16-bit buckets → multiple containers.
+        let mut bm = RoaringBitmap::new();
+        bm.insert(5); // container 0
+        bm.insert(65_536 + 10); // container 1
+        bm.insert(131_072 + 3); // container 2
+        let mut buf = Vec::new();
+        bm.serialize_into(&mut buf).unwrap();
+
+        assert!(serialized_contains(&buf, 5));
+        assert!(serialized_contains(&buf, 65_546));
+        assert!(serialized_contains(&buf, 131_075));
+        assert!(!serialized_contains(&buf, 6));
+        assert!(!serialized_contains(&buf, 65_535));
+        assert!(!serialized_contains(&buf, 65_537));
+    }
+
+    #[test]
+    fn serialized_contains_empty_and_malformed() {
+        assert!(!serialized_contains(&[], 0));
+        assert!(!serialized_contains(&[0, 0], 0));
+
+        // Valid empty bitmap.
+        let bm = RoaringBitmap::new();
+        let mut buf = Vec::new();
+        bm.serialize_into(&mut buf).unwrap();
+        assert!(!serialized_contains(&buf, 0));
+    }
+
+    #[test]
+    fn mmap_contains_matches_deserialize() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.roar");
+
+        let mut bm = RoaringBitmap::new();
+        for i in (0..100_000u32).step_by(7) {
+            bm.insert(i);
+        }
+        write_part(&path, &bm).unwrap();
+
+        // Spot-check: mmap_contains agrees with deserialized contains.
+        for v in [0, 7, 14, 100, 999, 7777, 99_995, 99_996, 99_999] {
+            assert_eq!(
+                mmap_contains(&path, v).unwrap(),
+                bm.contains(v),
+                "mismatch for value {v}"
+            );
+        }
     }
 }

@@ -22,6 +22,8 @@ use std::sync::{Arc, RwLock};
 use roaring::RoaringBitmap;
 
 use crate::catalog::Catalog;
+use redb::ReadableTable;
+
 use crate::error::{validate_event_name, InoxSetError};
 use crate::mempart::MemPartSnapshot;
 use crate::period::catalog_key;
@@ -280,21 +282,108 @@ impl InoxSet {
     pub fn find_memberships(&self, external_id: &str) -> Result<Vec<(String, Period)>> {
         self.check_closed()?;
 
-        let events = self.list_events()?;
+        // Phase 1: resolve dict IDs per event.
+        let events = self.catalog.list_events()?;
+        let mut event_ids: Vec<(String, u32)> = Vec::new();
+        for ev in &events {
+            if let Some(id) = dict::lookup(self.catalog.db(), &ev.name, external_id)? {
+                event_ids.push((ev.name.clone(), id));
+            }
+        }
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: single batched read txn — collect all part file paths + bytes.
+        let txn = self.catalog.db().begin_read()?;
+        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
+        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
+        let parts_table = txn.open_table(catalog::PARTS)?;
+
+        // Pre-read all part files into an in-memory cache to avoid repeated
+        // open() syscalls. Key = part_id, Value = file bytes.
+        let mut file_cache: std::collections::HashMap<u64, Vec<u8>> =
+            std::collections::HashMap::new();
+
         let mut memberships = Vec::new();
 
-        for ev in &events {
-            // Resolve the external ID in this event's dictionary scope.
-            let internal_id = match dict::lookup(self.catalog.db(), &ev.name, external_id)? {
-                Some(id) => id,
-                None => continue,
-            };
+        for (event_name, internal_id) in &event_ids {
+            // Prefix scan for this event's period keys.
+            let prefix = format!("{}/", event_name);
+            let mut period_keys: Vec<String> = Vec::new();
+            for item in pp_table.iter()? {
+                let (k, _) = item?;
+                let key = k.value();
+                if key.starts_with(&prefix) {
+                    period_keys.push(key.to_string());
+                }
+            }
 
-            let periods = self.list_periods(&ev.name)?;
-            for period in periods {
-                let bitmap = self.get(&ev.name, period)?;
-                if bitmap.contains(internal_id) {
-                    memberships.push((ev.name.clone(), period));
+            for cat_key in &period_keys {
+                let data_ids = Catalog::txn_get_period_parts(&pp_table, cat_key)?;
+
+                let mut found = false;
+                for pid in &data_ids {
+                    if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
+                        let bytes = file_cache
+                            .entry(*pid)
+                            .or_insert_with(|| std::fs::read(&part.file_path).unwrap_or_default());
+                        if part_store::serialized_contains(bytes, *internal_id) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    continue;
+                }
+
+                // Check tombstones.
+                let delta_ids = Catalog::txn_get_period_deltas(&pd_table, cat_key)?;
+                let mut tombstoned = false;
+                for pid in &delta_ids {
+                    if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
+                        let bytes = file_cache
+                            .entry(*pid)
+                            .or_insert_with(|| std::fs::read(&part.file_path).unwrap_or_default());
+                        if part_store::serialized_contains(bytes, *internal_id) {
+                            tombstoned = true;
+                            break;
+                        }
+                    }
+                }
+                if tombstoned {
+                    continue;
+                }
+
+                if let Some(period_key) = cat_key.splitn(3, '/').nth(2) {
+                    if let Some(period) = period::parse_period_key(period_key) {
+                        memberships.push((event_name.clone(), period));
+                    }
+                }
+            }
+        }
+
+        // Phase 3: check mempart for unflushed data.
+        {
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            for (event_name, internal_id) in &event_ids {
+                for ((ev, period), bm) in &mp.bitmaps {
+                    if ev == event_name && bm.contains(*internal_id) {
+                        let deltad = mp
+                            .get_delta(event_name, period)
+                            .is_some_and(|d| d.contains(*internal_id));
+                        if !deltad
+                            && !memberships
+                                .iter()
+                                .any(|(e, p)| e == event_name && p == period)
+                        {
+                            memberships.push((event_name.clone(), *period));
+                        }
+                    }
                 }
             }
         }
@@ -304,9 +393,9 @@ impl InoxSet {
 
     /// Checks whether an external ID is present in a specific event and period.
     ///
-    /// More efficient than [`find_memberships`](Self::find_memberships) when
-    /// checking a single event/period. Avoids full bitmap deserialization if
-    /// the event/ID is not in the dictionary.
+    /// Uses zero-copy membership checks on serialized roaring bytes via
+    /// [`part_store::mmap_contains`], avoiding full bitmap deserialization.
+    /// Falls back to in-memory check for unflushed data.
     ///
     /// # Errors
     ///
@@ -317,8 +406,90 @@ impl InoxSet {
             Some(id) => id,
             None => return Ok(false),
         };
-        let bitmap = self.get(event, period)?;
-        Ok(bitmap.contains(internal_id))
+        self.contains_bit(event, period, internal_id)
+    }
+
+    /// Checks whether a raw u32 value is present in the bitmap for an event
+    /// and period, using zero-copy serialized checks on disk parts.
+    fn contains_bit(&self, event: &str, period: Period, value: u32) -> Result<bool> {
+        // Check mempart first (cheap, in-memory).
+        {
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            if let Some(bm) = mp.get_bitmap(event, &period) {
+                if bm.contains(value) {
+                    // Check mempart delta — might have been removed.
+                    if let Some(delta) = mp.get_delta(event, &period) {
+                        if delta.contains(value) {
+                            // Removed in mempart — still need to check disk.
+                        } else {
+                            return Ok(true);
+                        }
+                    } else {
+                        return Ok(true);
+                    }
+                }
+            }
+            // Check if mempart delta removes it (even if not in mempart bitmap).
+            if let Some(delta) = mp.get_delta(event, &period) {
+                if delta.contains(value) {
+                    // Value is tombstoned — even if on disk, it's deleted.
+                    // But we need to know if it was on disk first to give
+                    // correct result. A delta only matters if the value exists
+                    // on disk. Check disk, then apply delta.
+                }
+            }
+        }
+
+        // Check disk parts via serialized contains (zero-copy).
+        let cat_key = period::catalog_key(event, period.granularity(), &period);
+        let txn = self.catalog.db().begin_read()?;
+        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
+        let parts_table = txn.open_table(catalog::PARTS)?;
+
+        let data_part_ids = Catalog::txn_get_period_parts(&pp_table, &cat_key)?;
+
+        let mut found_on_disk = false;
+        for pid in &data_part_ids {
+            if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
+                if part_store::mmap_contains(&part.file_path, value)? {
+                    found_on_disk = true;
+                    break;
+                }
+            }
+        }
+
+        if !found_on_disk {
+            return Ok(false);
+        }
+
+        // Check disk deltas.
+        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
+        let delta_part_ids = Catalog::txn_get_period_deltas(&pd_table, &cat_key)?;
+        for pid in &delta_part_ids {
+            if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
+                if part_store::mmap_contains(&part.file_path, value)? {
+                    return Ok(false); // tombstoned
+                }
+            }
+        }
+
+        // Check mempart delta.
+        {
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            if let Some(delta) = mp.get_delta(event, &period) {
+                if delta.contains(value) {
+                    return Ok(false);
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     /// Writes a set of external IDs for the given event and period.

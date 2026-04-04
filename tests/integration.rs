@@ -719,3 +719,40 @@ fn inverted_index_compaction_preserves() {
     assert_eq!(store.find_memberships("alice").unwrap().len(), 1);
     assert_eq!(store.find_memberships("bob").unwrap().len(), 1);
 }
+<<<<<<< HEAD
+=======
+
+// --- Cross-Event Intersection (global dict) ---
+
+#[test]
+fn cross_event_intersection_correct_with_global_dict() {
+    // Global dictionary assigns the same u32 to the same external_id across
+    // all events, so cross-event bitmap intersection produces correct results.
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+
+    // "alice" visits pages; "alice" is also premium.
+    store
+        .put_ids("page_visitors", Period::Day(2026, 4, 1), &["alice", "bob"])
+        .unwrap();
+    store
+        .put_ids("premium", Period::Static, &["charlie", "alice"])
+        .unwrap();
+    store.flush().unwrap();
+
+    let visitors = store.get("page_visitors", Period::Day(2026, 4, 1)).unwrap();
+    let premium = store.get("premium", Period::Static).unwrap();
+    let intersection = &visitors & &premium;
+
+    // With global dict: alice gets the SAME u32 in both events.
+    // Bitmap intersection correctly returns only alice.
+    assert_eq!(
+        intersection.len(),
+        1,
+        "global dict: intersection should contain exactly alice"
+    );
+}
+>>>>>>> f41c550 (fix: cross-event intersection now correct with global dictionary)

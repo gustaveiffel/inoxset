@@ -1,0 +1,204 @@
+# Performance Analysis
+
+Detailed benchmark results, flamegraph analysis, and competitive comparison for inoxset.
+
+**Hardware:** Apple M-series, single thread. All benchmarks use [Criterion](https://github.com/bheisler/criterion.rs).
+
+---
+
+## Summary
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| `put_bitmap` (1K bits) | 2.3 µs | In-memory accumulation |
+| `get` (1 part, mmap) | 14 µs | Memory-mapped read |
+| `get` (compacted, 100K bits) | 15 µs | Single merged part |
+| `put_ids` (1K string IDs) | 289 µs | Dictionary + bitmap |
+| `get_ids` (1K string IDs) | 360 µs | Bitmap + reverse dict |
+| `find_memberships` hit (600 checks) | **29 µs** | Inverted index, bloom+roaring+flat array |
+| `find_memberships` miss | **30 ns** | Bloom filter L1 rejects |
+| `contains_id` | ~50 ns | Inverted index path |
+| `flush` (10ev × 100 periods) | 342 ms | Disk I/O bound |
+| `compact` (50p × 5 parts) | 190 ms | Merge + rewrite |
+
+---
+
+## Reverse Membership Lookups
+
+The most optimized path in inoxset. Use case: real-time ad bidding — "which segments is user X in?"
+
+### Architecture
+
+```
+find_memberships("user-X")
+
+  ┌──────────────────────────────┐
+  │ 1. Bloom Filter (L1)         │  ~3 ns
+  │    Fast probabilistic reject │──→ false? return [] (80%+ of traffic)
+  └──────────┬───────────────────┘
+             │ maybe exists
+  ┌──────────▼───────────────────┐
+  │ 2. Roaring Pre-Filter (L2)   │  ~12 ns
+  │    Exact membership (h32)    │──→ false? return [] (catches bloom FPs)
+  └──────────┬───────────────────┘
+             │ definitely exists
+  ┌──────────▼───────────────────┐
+  │ 3. Flat Sorted Array (L3)    │  ~30 ns
+  │    Binary search on FxHash64 │
+  │    4-byte packed memberships │
+  └──────────┬───────────────────┘
+             │ decode
+  ┌──────────▼───────────────────┐
+  │ 4. Decode Memberships        │  ~50 ns
+  │    event_id → name           │
+  │    period_id → Period        │
+  └──────────────────────────────┘
+```
+
+### Results
+
+| Scenario | Disabled (default) | Inverted Index (OnFlush) | Improvement |
+|----------|-------------------|--------------------------|-------------|
+| Hit (600 segment×period checks) | 7.25 ms | **29 µs** | **250x** |
+| Miss (unknown entity) | 17 µs | **30 ns** | **567x** |
+| Per-membership check | 12 µs | **48 ns** | **250x** |
+
+### Configuration
+
+```rust
+// Opt-in: enable inverted index
+let store = InoxSet::builder()
+    .path("data/store")
+    .index_freshness(IndexFreshness::OnFlush)
+    .open()?;
+```
+
+| Mode | Latency | Freshness | RAM overhead |
+|------|---------|-----------|-------------|
+| `Disabled` (default) | ~7 ms | N/A | 0 |
+| `OnFlush` | **~29 µs** | At flush() | ~620 MB - 2.2 GB per shard |
+| `OnCompact` | **~29 µs** | At compact() | ~620 MB - 2.2 GB per shard |
+
+RAM depends on dataset: ~600 MB for 10M entities × 10 memberships, ~2.2 GB for 10M × 50.
+
+---
+
+## Competitive Comparison
+
+Compared on the same machine, localhost. Redis 7.x, [bitmapist-server](https://github.com/Doist/bitmapist-server) v1.9.
+
+### Write (1K IDs)
+
+| | inoxset | Redis (pipeline) | bitmapist-server | Factor |
+|---|---|---|---|---|
+| Latency | **2.3 µs** | 1.19 ms | 2.60 ms | **500x vs Redis** |
+
+### Read (10K bitmap)
+
+| | inoxset | Redis (BITCOUNT) | bitmapist-server | Factor |
+|---|---|---|---|---|
+| Latency | **14 µs** | 86 µs | 18 µs | **6x vs Redis** |
+
+### Intersection (10K ∩ 10K)
+
+| | inoxset | Redis (BITOP AND) | bitmapist-server | Factor |
+|---|---|---|---|---|
+| Latency | **30 µs** | 87 µs | 21 µs | **3x vs Redis** |
+
+### Reverse Membership (600 checks)
+
+| | inoxset (inverted) | Redis (GETBIT pipeline) | bitmapist-server | Factor |
+|---|---|---|---|---|
+| Latency | **29 µs** | 721 µs | 1.54 ms | **25x vs Redis, 53x vs bitmapist** |
+
+### Why inoxset is faster
+
+- **Embedded**: no network round-trip (0 vs ~50-100 µs per request)
+- **Memory-mapped reads**: OS page cache, zero-copy bitmap access
+- **Roaring Bitmaps**: compressed set operations (AND/OR/XOR in microseconds)
+- **Inverted index**: pre-computed reverse lookup with bloom + flat array (no disk I/O)
+
+---
+
+## Flamegraph Analysis
+
+### Baseline (without inverted index)
+
+**Profile**: `find_memberships` scanning 600 (event, period) combos.
+
+Top bottlenecks:
+1. **redb B-tree traversal** (~35%) — `Btree::get_helper`, `BranchAccessor::child_for_key`
+2. **redb infrastructure** (~25%) — `PagedCachedFile::read`, `Mutex::lock`, `from_utf8`
+3. **String allocations** (~15%) — `format!()` for catalog keys
+4. **Memory operations** (~15%) — `memmove`, `memcmp`, `realloc`
+5. **File I/O** (~5%) — `File::open_c`
+6. **Bitmap operations** (~0%) — `serialized_contains` invisible
+
+Key insight: `exists()` ≈ `get()` ≈ `contains_id()` in latency, proving that bitmap read/deserialization cost is negligible — the bottleneck was 100% catalog lookup overhead.
+
+### Post inverted index
+
+The inverted index hot path (bloom + binary search) is **invisible in the flamegraph** — too fast relative to setup/rebuild costs. redb operations appear only in the rebuild path (at flush time), not on the query path.
+
+---
+
+## How to Reproduce
+
+### Run benchmarks
+
+```bash
+# All benchmarks
+cargo bench
+
+# Specific groups
+cargo bench --bench benchmarks -- "find_memberships"
+cargo bench --bench benchmarks -- "find_memberships_inverted"
+
+# Competitive comparison (requires Redis + bitmapist-server)
+redis-server --daemonize yes
+bitmapist-server -addr localhost:6380 -db /tmp/bitmapist.db &
+cargo bench --bench comparison
+```
+
+### Run instrumented profiling
+
+```bash
+cargo run --example profile_find --release
+```
+
+### Generate flamegraph (macOS, requires sudo for dtrace)
+
+```bash
+sudo cargo flamegraph --example profile_find -o flamegraph.svg
+open flamegraph.svg  # view in browser
+```
+
+### Benchmark scenario
+
+The standard benchmark scenario uses:
+- 20 segments × 30 days = 600 (event, period) combos
+- 10,000 unique entity IDs per combo
+- Compacted (single part file per period)
+- Both hit (entity in all 600 combos) and miss (unknown entity)
+
+---
+
+## Optimization History
+
+| Phase | Change | Hit (600) | Miss | Commit |
+|-------|--------|-----------|------|--------|
+| Baseline | Bitmap scan, per-file reads | 7.25 ms | 17 µs | — |
+| Phase 0 | ArcSwap ReadIndex (cache catalog in RAM) | 7.0 ms | 3.5 µs | `9e22d08` |
+| **Inverted Index** | Bloom L1 + Roaring L2 + flat array | **29 µs** | **30 ns** | `0a0fade` |
+
+### What didn't work
+
+- **`serialized_contains` on mmap'd bytes** — saved 0% because the bottleneck was redb lookups, not bitmap deserialization
+- **File cache in `find_memberships`** — saved ~24% by caching `fs::read()` results, but still 600 file opens
+- **Phase 0 ReadIndex alone** — saved only 26% because file I/O replaced redb as the bottleneck
+
+### What worked
+
+- **Inverted index** — eliminated the entire scan loop. One HashMap-style lookup replaces 600 file reads + 1200 redb queries.
+- **Bloom filter L1** — rejects 80%+ of traffic in 3ns without touching any data structure
+- **Flat sorted array** — binary search on u64 hashes with 4-byte packed memberships, single contiguous allocation

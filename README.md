@@ -91,6 +91,20 @@ let users: Vec<String> = store.get_ids("premium", Period::Day(2026, 3, 18))?;
 store.remove_ids("premium", Period::Day(2026, 3, 18), &["usr_9f3a2b-..."])?;
 ```
 
+**Reverse membership lookups** — "which segments is user X in?" answered in sub-microsecond via an opt-in inverted index with bloom filter pre-filtering.
+
+```rust
+let store = InoxSet::builder()
+    .path("data/my_store")
+    .index_freshness(IndexFreshness::OnFlush)
+    .open()?;
+
+// After putting data and flushing...
+let segments = store.find_memberships("user-abc")?;
+// → [("premium", Day(2026, 4, 1)), ("active", Day(2026, 4, 1))]
+// 29µs for 600 checks. 30ns for unknown entities.
+```
+
 **Embeddable** — pure Rust, sync API, no runtime dependencies. Drop it into any application.
 
 ```rust
@@ -140,6 +154,8 @@ let result = tokio::task::spawn_blocking(move || {
 | `put_ids` | Write external string IDs (auto-mapped to u32 via dictionary) |
 | `get_ids` | Read back external string IDs for an event + period |
 | `remove_ids` | Delete external IDs via dictionary-resolved tombstones |
+| `find_memberships` | Reverse lookup: which segments contain this entity? (~29µs for 600 checks) |
+| `contains_id` | Check if an entity is in a specific event + period |
 | `remove_bits` | Delete specific u32 IDs via delta tombstones |
 | `replace_bitmap` | Atomically replace all data for a period |
 | `bulk_replace` | Replace multiple periods in a single transaction |
@@ -185,10 +201,12 @@ Measured with [Criterion](https://github.com/bheisler/criterion.rs) on Apple M-s
 | `get` | compacted, 100K bits | **15 µs** |
 | `put_ids` | 1K string IDs (dictionary) | **289 µs** |
 | `get_ids` | 1K string IDs (dictionary) | **360 µs** |
+| `find_memberships` | hit, 600 checks (inverted index) | **29 µs** |
+| `find_memberships` | miss (bloom rejects) | **30 ns** |
 | `flush` | 10 events x 100 periods | **342 ms** |
 | `compact` | 50 periods x 5 parts | **190 ms** |
 
-Baseline redb overhead: write txn commit ~4 ms, read txn open ~315 ns. Dictionary lookup ~290 ns/ID.
+Dictionary lookup ~290 ns/ID. Inverted index: ~48 ns/membership check.
 
 ### vs Redis and bitmapist-server
 
@@ -199,6 +217,7 @@ Compared on the same machine (Apple M-series, localhost). Redis 7.x on port 6379
 | Write 1K IDs | **2.3 µs** | 1.19 ms | 2.60 ms |
 | Read 10K bitmap | **14 µs** | 86 µs | 18 µs |
 | Intersection 10K ∩ 10K | **30 µs** | 87 µs | 21 µs |
+| Reverse lookup (600 checks) | **29 µs** | 721 µs | 1.54 ms |
 
 inoxset is **500x faster on writes** (no network, no serialization pipeline) and **3-6x faster on reads** (mmap, in-process roaring operations). bitmapist-server closes the gap on reads thanks to its roaring bitmap internals, but network overhead remains the bottleneck.
 

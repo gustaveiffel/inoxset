@@ -276,6 +276,74 @@ pub struct CompactStats {
     pub bytes_reclaimed: u64,
 }
 
+/// Index freshness strategy for inverted index rebuilds.
+///
+/// Controls when the inverted index is synchronized with the bitmap state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexFreshness {
+    /// Index is disabled; queries use only bitmap operations.
+    Disabled,
+    /// Index is rebuilt only during flush operations.
+    OnFlush,
+    /// Index is rebuilt only during compaction.
+    OnCompact,
+    /// Index is kept current after every write (highest overhead, lowest latency).
+    Immediate,
+}
+
+/// Compact 4-byte encoding of event and period membership in an index entry.
+///
+/// The high bit of the event_id field (`0x8000_0000`) serves as an extended-reference
+/// flag: when set, the entry points to an out-of-line structure; when clear, the entry
+/// encodes an inline `(event_id, period_id)` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Membership(pub(crate) u32);
+
+impl Membership {
+    /// Creates a new inline membership from event and period identifiers.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug mode if `event_id >= 0x7FFF` (reserved for extended references).
+    pub fn inline(event_id: u16, period_id: u16) -> Self {
+        debug_assert!(event_id < 0x7FFF, "event_id overflow: {event_id}");
+        Self(((event_id as u32) << 16) | period_id as u32)
+    }
+
+    /// Returns `true` if this entry uses an extended out-of-line reference.
+    pub fn is_extended(&self) -> bool {
+        self.0 & 0x8000_0000 != 0
+    }
+
+    /// Extracts the event ID from an inline membership entry.
+    ///
+    /// Returns the lower 15 bits of the upper 16 bits.
+    pub fn event_id(&self) -> u16 {
+        ((self.0 >> 16) & 0x7FFF) as u16
+    }
+
+    /// Extracts the period ID from an inline membership entry.
+    ///
+    /// Returns the lower 16 bits.
+    pub fn period_id(&self) -> u16 {
+        (self.0 & 0xFFFF) as u16
+    }
+}
+
+/// A single entry in an inverted index mapping user ID hashes to bitmap locations.
+///
+/// Each entry stores the hash of an external ID, a byte offset into the bitmap data,
+/// and the count of bitmap values stored at that location.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexEntry {
+    /// 64-bit hash of the external ID.
+    pub id_hash: u64,
+    /// Byte offset into the bitmap data.
+    pub offset: u32,
+    /// Number of bitmap values stored at this offset.
+    pub count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +438,27 @@ mod tests {
         ] {
             assert_eq!(PeriodState::from_u8(s.as_u8()), Some(s));
         }
+    }
+
+    #[test]
+    fn membership_inline_roundtrip() {
+        let m = Membership::inline(100, 5000);
+        assert!(!m.is_extended());
+        assert_eq!(m.event_id(), 100);
+        assert_eq!(m.period_id(), 5000);
+    }
+
+    #[test]
+    fn membership_max_inline_values() {
+        let m = Membership::inline(0x7FFE, 0xFFFF);
+        assert_eq!(m.event_id(), 0x7FFE);
+        assert_eq!(m.period_id(), 0xFFFF);
+        assert!(!m.is_extended());
+    }
+
+    #[test]
+    fn membership_extended_bit() {
+        let m = Membership(0x8000_0000);
+        assert!(m.is_extended());
     }
 }

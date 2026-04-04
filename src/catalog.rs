@@ -550,6 +550,9 @@ impl Catalog {
             write_txn.open_table(PERIOD_STATE)?;
             write_txn.open_table(COMPACTION_LOG)?;
             write_txn.open_table(NEXT_PART_ID)?;
+            write_txn.open_table(crate::dict::DICT_FWD)?;
+            write_txn.open_table(crate::dict::DICT_REV)?;
+            write_txn.open_table(crate::dict::NEXT_DICT_ID)?;
         }
         write_txn.commit()?;
         Ok(Self { db })
@@ -1362,5 +1365,14 @@ mod tests {
         // Verify that deserialize_event_config rejects too-short data
         let result = deserialize_event_config("test", &[1]); // only 1 byte
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn catalog_creates_dict_tables() {
+        let (cat, _dir) = test_catalog();
+        let rtxn = cat.db().begin_read().unwrap();
+        let _fwd = rtxn.open_table(crate::dict::DICT_FWD).unwrap();
+        let _rev = rtxn.open_table(crate::dict::DICT_REV).unwrap();
+        let _next = rtxn.open_table(crate::dict::NEXT_DICT_ID).unwrap();
     }
 }

@@ -268,6 +268,73 @@ impl InoxSet {
         Ok(deleted)
     }
 
+    /// Writes a set of external IDs for the given event and period.
+    ///
+    /// External IDs (strings) are transparently mapped to u32 values via
+    /// the dictionary encoding layer. New IDs are auto-assigned a monotonic
+    /// u32 on first encounter. The resulting bitmap is OR-accumulated with
+    /// any existing data, just like [`put_bitmap`](Self::put_bitmap).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    /// Returns an error on catalog or file I/O failure.
+    pub fn put_ids(&self, event: &str, period: Period, external_ids: &[&str]) -> Result<()> {
+        self.check_writable()?;
+        if external_ids.is_empty() {
+            return Ok(());
+        }
+        let internal_ids = dict::batch_assign_or_get(self.catalog.db(), event, external_ids)?;
+        let mut bitmap = RoaringBitmap::new();
+        for id in internal_ids {
+            bitmap.insert(id);
+        }
+        self.put_bitmap(event, period, bitmap)
+    }
+
+    /// Reads the external IDs stored for the given event and period.
+    ///
+    /// Retrieves the merged bitmap via [`get`](Self::get), then resolves
+    /// each u32 back to its external string ID through the dictionary.
+    /// IDs that cannot be resolved are silently omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn get_ids(&self, event: &str, period: Period) -> Result<Vec<String>> {
+        let bitmap = self.get(event, period)?;
+        let internal_ids: Vec<u32> = bitmap.iter().collect();
+        let resolved = dict::batch_reverse_lookup(self.catalog.db(), event, &internal_ids)?;
+        Ok(resolved.into_iter().flatten().collect())
+    }
+
+    /// Removes external IDs from the given event and period via delta tombstones.
+    ///
+    /// Looks up each external ID in the dictionary. IDs that have never been
+    /// assigned are silently ignored. The resolved u32 values are passed to
+    /// [`remove_bits`](Self::remove_bits).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    /// Returns an error on catalog or file I/O failure.
+    pub fn remove_ids(&self, event: &str, period: Period, external_ids: &[&str]) -> Result<()> {
+        self.check_writable()?;
+        if external_ids.is_empty() {
+            return Ok(());
+        }
+        let mut bits: Vec<u32> = Vec::new();
+        for ext_id in external_ids {
+            if let Some(internal) = dict::lookup(self.catalog.db(), event, ext_id)? {
+                bits.push(internal);
+            }
+        }
+        if bits.is_empty() {
+            return Ok(());
+        }
+        self.remove_bits(event, period, &bits)
+    }
+
     /// Looks up an event by name, auto-registering it with defaults if it
     /// doesn't exist.
     ///
@@ -2128,5 +2195,70 @@ mod tests {
         // Should be empty even without flush.
         let got = store.get("events", Period::Day(2026, 4, 1)).unwrap();
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn put_ids_get_ids_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        store
+            .put_ids(
+                "segment",
+                Period::Day(2026, 3, 18),
+                &["user-aaa", "user-bbb", "user-ccc"],
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        let ids = store.get_ids("segment", Period::Day(2026, 3, 18)).unwrap();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["user-aaa", "user-bbb", "user-ccc"]);
+    }
+
+    #[test]
+    fn remove_ids_deletes_through_dictionary() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        store
+            .put_ids(
+                "seg",
+                Period::Day(2026, 3, 18),
+                &["alice", "bob", "charlie"],
+            )
+            .unwrap();
+
+        store
+            .remove_ids("seg", Period::Day(2026, 3, 18), &["bob"])
+            .unwrap();
+
+        let ids = store.get_ids("seg", Period::Day(2026, 3, 18)).unwrap();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["alice", "charlie"]);
+    }
+
+    #[test]
+    fn remove_ids_unknown_id_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        store.put_ids("seg", Period::Static, &["x", "y"]).unwrap();
+
+        store.remove_ids("seg", Period::Static, &["z"]).unwrap();
+
+        let ids = store.get_ids("seg", Period::Static).unwrap();
+        assert_eq!(ids.len(), 2);
     }
 }

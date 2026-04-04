@@ -378,6 +378,54 @@ impl InoxSet {
     pub fn find_memberships(&self, external_id: &str) -> Result<Vec<(String, Period)>> {
         self.check_closed()?;
 
+        // Fast path: use inverted index if available.
+        if let InvertedStore::Frozen(swap) = &self.inverted {
+            let idx = swap.load();
+
+            // L1: bloom filter.
+            if !idx.maybe_contains(external_id) {
+                return Ok(Vec::new());
+            }
+
+            // L2: Roaring exact filter.
+            if !idx.definitely_contains(external_id) {
+                return Ok(Vec::new());
+            }
+
+            // L3: flat array binary search + decode.
+            let mut memberships = idx.lookup(external_id);
+
+            // Also check mempart for unflushed data.
+            {
+                let mp = self.writer.read().map_err(|e| {
+                    log::error!("RwLock poisoned: {e}");
+                    InoxSetError::Closed
+                })?;
+                // For unflushed data, we need dict lookups per event.
+                let events = &idx.meta().event_names;
+                for ev in events {
+                    if let Some(internal_id) = dict::lookup(self.catalog.db(), ev, external_id)? {
+                        for ((ev_name, period), bm) in &mp.bitmaps {
+                            if ev_name == ev && bm.contains(internal_id) {
+                                let deltad = mp
+                                    .get_delta(ev, period)
+                                    .is_some_and(|d| d.contains(internal_id));
+                                if !deltad
+                                    && !memberships.iter().any(|(e, p)| e == ev && p == period)
+                                {
+                                    memberships.push((ev.clone(), *period));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Ok(memberships);
+        }
+
+        // Disabled mode: fall through to existing bitmap-scanning path.
+
         // Load the read index (lock-free via ArcSwap).
         let idx = self.ridx.load();
 
@@ -478,6 +526,40 @@ impl InoxSet {
     /// Returns an error on catalog or file I/O failure.
     pub fn contains_id(&self, event: &str, period: Period, external_id: &str) -> Result<bool> {
         self.check_closed()?;
+
+        // Fast path: use inverted index if available.
+        if let InvertedStore::Frozen(swap) = &self.inverted {
+            let idx = swap.load();
+            if !idx.maybe_contains(external_id) {
+                return Ok(false);
+            }
+            if !idx.definitely_contains(external_id) {
+                return Ok(false);
+            }
+            // Check inverted index for this specific (event, period).
+            let found = idx.contains(external_id, event, &period);
+            if found {
+                return Ok(true);
+            }
+            // Check mempart for unflushed data.
+            if let Some(internal_id) = dict::lookup(self.catalog.db(), event, external_id)? {
+                let mp = self.writer.read().map_err(|e| {
+                    log::error!("RwLock poisoned: {e}");
+                    InoxSetError::Closed
+                })?;
+                if let Some(bm) = mp.get_bitmap(event, &period) {
+                    if bm.contains(internal_id) {
+                        let deltad = mp
+                            .get_delta(event, &period)
+                            .is_some_and(|d| d.contains(internal_id));
+                        return Ok(!deltad);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        // Disabled mode: existing path.
         let internal_id = match dict::lookup(self.catalog.db(), event, external_id)? {
             Some(id) => id,
             None => return Ok(false),
@@ -2560,5 +2642,58 @@ mod tests {
 
         let ids = store.get_ids("seg", Period::Static).unwrap();
         assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn find_memberships_with_inverted_index() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .index_freshness(crate::types::IndexFreshness::OnFlush)
+            .open()
+            .unwrap();
+
+        store
+            .put_ids("seg_a", Period::Day(2026, 4, 1), &["alice", "bob"])
+            .unwrap();
+        store
+            .put_ids("seg_b", Period::Day(2026, 4, 1), &["alice", "charlie"])
+            .unwrap();
+        store.flush().unwrap();
+
+        let m = store.find_memberships("alice").unwrap();
+        assert_eq!(m.len(), 2);
+
+        let m = store.find_memberships("bob").unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, "seg_a");
+
+        let m = store.find_memberships("unknown").unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn contains_id_with_inverted_index() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .index_freshness(crate::types::IndexFreshness::OnFlush)
+            .open()
+            .unwrap();
+
+        store
+            .put_ids("seg", Period::Day(2026, 4, 1), &["alice", "bob"])
+            .unwrap();
+        store.flush().unwrap();
+
+        assert!(store
+            .contains_id("seg", Period::Day(2026, 4, 1), "alice")
+            .unwrap());
+        assert!(!store
+            .contains_id("seg", Period::Day(2026, 4, 1), "unknown")
+            .unwrap());
+        assert!(!store
+            .contains_id("seg", Period::Day(2026, 4, 2), "alice")
+            .unwrap());
     }
 }

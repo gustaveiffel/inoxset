@@ -5,10 +5,6 @@
 //! 2. [`RoaringBitmap`] over FxHash32 values (L2) — eliminates Bloom false positives.
 //! 3. Binary search on FxHash64 over sorted [`IndexEntry`] list (exact lookup).
 
-// Items are pub(crate) and consumed by future modules; suppress dead-code lint
-// until the integration point is wired up.
-#![allow(dead_code)]
-
 use roaring::RoaringBitmap;
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
@@ -113,6 +109,11 @@ impl InvertedIndex {
         self.lookup(external_id)
             .iter()
             .any(|(e, p)| e == event && p == period)
+    }
+
+    /// Returns a reference to the decode tables.
+    pub fn meta(&self) -> &InvertedMeta {
+        &self.meta
     }
 
     /// Constructs an empty index (for use in [`Disabled`](crate::types::IndexFreshness::Disabled) mode).

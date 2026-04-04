@@ -177,16 +177,18 @@ Measured with [Criterion](https://github.com/bheisler/criterion.rs) on Apple M-s
 
 | Operation | Scenario | Median |
 |-----------|----------|--------|
-| `put_bitmap` | 1K bits | **4.1 µs** |
-| `put_bitmap` | 1K bits + rollup auto | **10.7 µs** |
-| `get` | 1 part (mmap) | **29.6 µs** |
-| `get` | 5 parts merged | **119.9 µs** |
-| `get` | 20 parts merged | **468 µs** |
-| `get` | compacted, 100K bits | **28.0 µs** |
-| `flush` | 10 events x 100 periods | **321 ms** |
-| `compact` | 50 periods x 5 parts | **231 ms** |
+| `put_bitmap` | 1K bits | **2.3 µs** |
+| `put_bitmap` | 1K bits + rollup auto | **6.2 µs** |
+| `get` | 1 part (mmap) | **14 µs** |
+| `get` | 5 parts merged | **65 µs** |
+| `get` | 20 parts merged | **259 µs** |
+| `get` | compacted, 100K bits | **15 µs** |
+| `put_ids` | 1K string IDs (dictionary) | **289 µs** |
+| `get_ids` | 1K string IDs (dictionary) | **360 µs** |
+| `flush` | 10 events x 100 periods | **342 ms** |
+| `compact` | 50 periods x 5 parts | **190 ms** |
 
-Baseline redb overhead: write txn commit ~2.6 ms, read txn open ~659 ns.
+Baseline redb overhead: write txn commit ~4 ms, read txn open ~315 ns. Dictionary lookup ~290 ns/ID.
 
 Run your own: `cargo bench`
 

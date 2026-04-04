@@ -215,6 +215,77 @@ fn bench_redb_txn_baseline(c: &mut Criterion) {
     });
 }
 
+fn bench_put_ids(c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .mempart_flush_threshold(1024 * 1024 * 1024)
+        .open()
+        .unwrap();
+
+    // Pre-generate 1000 external IDs.
+    let ids: Vec<String> = (0..1000).map(|i| format!("usr-{i:08}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+    c.bench_function("put_ids/1K_new_ids", |b| {
+        // First call assigns, subsequent calls are lookups.
+        b.iter(|| {
+            store
+                .put_ids("dict_bench", Period::Day(2026, 4, 1), black_box(&id_refs))
+                .unwrap();
+        })
+    });
+}
+
+fn bench_get_ids(c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+
+    // Seed dictionary + bitmap.
+    let ids: Vec<String> = (0..1000).map(|i| format!("usr-{i:08}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    store
+        .put_ids("dict_bench", Period::Day(2026, 4, 1), &id_refs)
+        .unwrap();
+    store.flush().unwrap();
+
+    c.bench_function("get_ids/1K_ids", |b| {
+        b.iter(|| {
+            black_box(
+                store
+                    .get_ids("dict_bench", Period::Day(2026, 4, 1))
+                    .unwrap(),
+            );
+        })
+    });
+}
+
+fn bench_dict_assign_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dict/assign");
+
+    for n in [100, 1000, 10_000] {
+        let dir = TempDir::new().unwrap();
+        let db = redb::Database::create(dir.path().join("dict.redb")).unwrap();
+        inoxset::dict::ensure_tables(&db).unwrap();
+
+        let ids: Vec<String> = (0..n).map(|i| format!("id-{i:08}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+        // First call seeds the dictionary.
+        inoxset::dict::batch_assign_or_get(&db, "ev", &id_refs).unwrap();
+
+        group.bench_with_input(BenchmarkId::new("warm", n), &n, |b, _| {
+            b.iter(|| {
+                black_box(inoxset::dict::batch_assign_or_get(&db, "ev", &id_refs).unwrap());
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_put_bitmap,
@@ -223,6 +294,9 @@ criterion_group!(
     bench_get_compacted,
     bench_flush,
     bench_compact,
+    bench_put_ids,
+    bench_get_ids,
+    bench_dict_assign_throughput,
     bench_redb_txn_baseline,
 );
 criterion_main!(benches);

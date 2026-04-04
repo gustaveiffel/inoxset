@@ -541,7 +541,11 @@ fn dict_put_get_flush_reopen() {
     {
         let store = InoxSet::builder().path(&path).open().unwrap();
         store
-            .put_ids("audience", Period::Day(2026, 4, 1), &["usr-001", "usr-002", "usr-003"])
+            .put_ids(
+                "audience",
+                Period::Day(2026, 4, 1),
+                &["usr-001", "usr-002", "usr-003"],
+            )
             .unwrap();
         store.flush().unwrap();
         store.close().unwrap();
@@ -549,9 +553,7 @@ fn dict_put_get_flush_reopen() {
 
     {
         let store = InoxSet::builder().path(&path).open().unwrap();
-        let ids = store
-            .get_ids("audience", Period::Day(2026, 4, 1))
-            .unwrap();
+        let ids = store.get_ids("audience", Period::Day(2026, 4, 1)).unwrap();
         let mut sorted = ids;
         sorted.sort();
         assert_eq!(sorted, vec!["usr-001", "usr-002", "usr-003"]);

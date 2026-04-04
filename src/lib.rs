@@ -272,6 +272,10 @@ impl InoxSet {
 
     /// Finds all `(event, period)` pairs where the given external ID is present.
     ///
+    /// **Note:** This API is unstable and will be significantly optimized in a
+    /// future release (arena storage, inverted index). The signature will remain
+    /// the same but performance characteristics will change.
+    ///
     /// Resolves the external ID through the dictionary, then checks membership
     /// across all events and periods. Returns an empty vec if the ID has never
     /// been assigned.
@@ -392,6 +396,9 @@ impl InoxSet {
     }
 
     /// Checks whether an external ID is present in a specific event and period.
+    ///
+    /// **Note:** This API is unstable and will be significantly optimized in a
+    /// future release (arena storage). The signature will remain the same.
     ///
     /// Uses zero-copy membership checks on serialized roaring bytes via
     /// [`part_store::mmap_contains`], avoiding full bitmap deserialization.

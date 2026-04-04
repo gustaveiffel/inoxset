@@ -3,6 +3,7 @@
 // Library-first sync API. No async, no server.
 // Embed via spawn_blocking in async runtimes.
 
+pub(crate) mod bloom;
 pub mod builder;
 pub mod catalog;
 pub mod dict;

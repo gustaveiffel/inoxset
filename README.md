@@ -65,6 +65,14 @@ store.remove_bits("logins", Period::Hour(2026, 3, 18, 14), &[42])?;
 store.compact()?;
 ```
 
+**GDPR erasure** — delete an entity from all segments and periods in one call. Removes bitmap bits, dictionary entry, and inverted index references.
+
+```rust
+// Delete user from all segments + clean up dictionary
+let removed = store.delete_entity("usr_9f3a2b-...")?;
+println!("removed from {} segment×period pairs", removed);
+```
+
 **Compaction** — merge accumulated parts and apply deletes for optimal read performance.
 
 ```rust
@@ -75,7 +83,7 @@ println!(
 );
 ```
 
-**Dictionary encoding** — store arbitrary string IDs (UUID, nanoid) in u32 Roaring Bitmaps. The mapping is automatic and persistent.
+**Dictionary encoding** — store arbitrary string IDs (UUID, nanoid) in u32 Roaring Bitmaps. The mapping is global: the same ID always maps to the same u32, so cross-event set operations (intersection, union, difference) are correct by construction.
 
 ```rust
 // Write with string IDs — dictionary assigns u32 internally
@@ -199,9 +207,9 @@ Measured with [Criterion](https://github.com/bheisler/criterion.rs) on Apple M-s
 | `get` | 1 part (mmap) | **14 µs** |
 | `get` | 5 parts merged | **65 µs** |
 | `get` | 20 parts merged | **259 µs** |
-| `get` | compacted, 100K bits | **15 µs** |
-| `put_ids` | 1K string IDs (dictionary) | **289 µs** |
-| `get_ids` | 1K string IDs (dictionary) | **360 µs** |
+| `get` | compacted, 100K bits (bitmap cache) | **426 ns** |
+| `put_ids` | 1K string IDs (dictionary) | **207 µs** |
+| `get_ids` | 1K string IDs (dictionary) | **103 µs** |
 | `find_memberships` | hit, 600 checks (inverted index) | **29 µs** |
 | `find_memberships` | miss (bloom rejects) | **30 ns** |
 | `flush` | 10 events x 100 periods | **342 ms** |

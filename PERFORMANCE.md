@@ -11,15 +11,31 @@ Detailed benchmark results, flamegraph analysis, and competitive comparison for 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
 | `put_bitmap` (1K bits) | 2.3 µs | In-memory accumulation |
-| `get` (compacted, 10K bits) | **~800 ns** | Served from bitmap cache |
-| `put_ids` (1K string IDs) | 289 µs | Dictionary + bitmap |
-| `get_ids` (1K string IDs) | 360 µs | Bitmap + reverse dict |
+| `get` (compacted, 10K bits) | **242 ns** | Served from bitmap cache |
+| `get` (compacted, 100K bits) | **426 ns** | Served from bitmap cache |
+| `put_ids` (1K string IDs) | **207 µs** | Global dictionary + bitmap |
+| `get_ids` (1K string IDs) | **103 µs** | Bitmap + reverse dict |
 | `find_memberships` hit (600 checks) | **29 µs** | Inverted index, bloom+roaring+flat array |
 | `find_memberships` miss | **30 ns** | Bloom filter L1 rejects |
 | Intersection (10K ∩ 10K) | **784 ns** | Bitmap cache + Roaring AND |
 | `contains_id` | ~50 ns | Inverted index path |
 | `flush` (10ev × 100 periods) | 342 ms | Disk I/O bound |
 | `compact` (50p × 5 parts) | 190 ms | Merge + rewrite |
+
+---
+
+## Disk Usage
+
+inoxset uses a global dictionary (one u32 per external_id across all events) and Roaring Bitmap compression.
+
+| Scenario | Total disk | Catalog (redb) | Parts (.roar) | Amplification |
+|----------|-----------|----------------|---------------|--------------|
+| 20 events × 30 days × 10K users | 7.2 MB | 2.5 MB | 4.7 MB | 63x |
+| 50 events × 30 days × 100K users | 40 MB | 16.6 MB | 23.5 MB | 35x |
+
+Roaring compression: 1.3 bits/user at 100K scale (sequential IDs). The catalog stores dictionary mappings and part metadata in redb B-tree format.
+
+Profile disk usage: `cargo run --example profile_amplification --release`
 
 ---
 
@@ -202,7 +218,8 @@ The standard benchmark scenario uses:
 | Baseline | Bitmap scan, per-file reads | 7.25 ms | 30 µs | — |
 | Phase 0 | ArcSwap ReadIndex (cache catalog) | 7.0 ms | 30 µs | `9e22d08` |
 | Inverted Index | Bloom L1 + Roaring L2 + flat array | **29 µs** | 30 µs | `0a0fade` |
-| **Bitmap Cache** | Pre-deserialized bitmaps in ReadIndex | **29 µs** | **784 ns** | `5377766` |
+| Bitmap Cache | Pre-deserialized bitmaps in ReadIndex | **29 µs** | **784 ns** | `5377766` |
+| **Global Dict** | One u32 per entity, 26x less disk, bitmap cache reads at 242ns | **27 µs** | **794 ns** | `40c523c` |
 
 ### What didn't work
 

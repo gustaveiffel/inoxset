@@ -111,11 +111,6 @@ impl InvertedIndex {
             .any(|(e, p)| e == event && p == period)
     }
 
-    /// Returns a reference to the decode tables.
-    pub fn meta(&self) -> &InvertedMeta {
-        &self.meta
-    }
-
     /// Constructs an empty index (for use in [`Disabled`](crate::types::IndexFreshness::Disabled) mode).
     pub(crate) fn empty() -> Self {
         Self {

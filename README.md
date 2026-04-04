@@ -156,6 +156,7 @@ let result = tokio::task::spawn_blocking(move || {
 | `remove_ids` | Delete external IDs via dictionary-resolved tombstones |
 | `find_memberships` | Reverse lookup: which segments contain this entity? (~29µs for 600 checks) |
 | `contains_id` | Check if an entity is in a specific event + period |
+| `delete_entity` | GDPR erasure: remove entity from all segments + dict |
 | `remove_bits` | Delete specific u32 IDs via delta tombstones |
 | `replace_bitmap` | Atomically replace all data for a period |
 | `bulk_replace` | Replace multiple periods in a single transaction |

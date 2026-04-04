@@ -275,11 +275,11 @@ fn bench_dict_assign_throughput(c: &mut Criterion) {
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
 
         // First call seeds the dictionary.
-        inoxset::dict::batch_assign_or_get(&db, "ev", &id_refs).unwrap();
+        inoxset::dict::batch_assign_or_get(&db, &id_refs).unwrap();
 
         group.bench_with_input(BenchmarkId::new("warm", n), &n, |b, _| {
             b.iter(|| {
-                black_box(inoxset::dict::batch_assign_or_get(&db, "ev", &id_refs).unwrap());
+                black_box(inoxset::dict::batch_assign_or_get(&db, &id_refs).unwrap());
             })
         });
     }

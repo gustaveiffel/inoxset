@@ -154,7 +154,7 @@ impl InoxSet {
                 if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
                     for internal_id in bm.iter() {
                         if let Ok(Some(ext_id)) =
-                            dict::reverse_lookup(self.catalog.db(), ev, internal_id)
+                            dict::reverse_lookup(self.catalog.db(), internal_id)
                         {
                             builder.add(&ext_id, event_id, period_id);
                         }
@@ -404,7 +404,7 @@ impl InoxSet {
                 // For unflushed data, we need dict lookups per event.
                 let events = &idx.meta().event_names;
                 for ev in events {
-                    if let Some(internal_id) = dict::lookup(self.catalog.db(), ev, external_id)? {
+                    if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
                         for ((ev_name, period), bm) in &mp.bitmaps {
                             if ev_name == ev && bm.contains(internal_id) {
                                 let deltad = mp
@@ -432,7 +432,7 @@ impl InoxSet {
         // Phase 1: resolve dict IDs per event.
         let mut event_ids: Vec<(String, u32)> = Vec::new();
         for ev in &idx.event_names {
-            if let Some(id) = dict::lookup(self.catalog.db(), ev, external_id)? {
+            if let Some(id) = dict::lookup(self.catalog.db(), external_id)? {
                 event_ids.push((ev.clone(), id));
             }
         }
@@ -542,7 +542,7 @@ impl InoxSet {
                 return Ok(true);
             }
             // Check mempart for unflushed data.
-            if let Some(internal_id) = dict::lookup(self.catalog.db(), event, external_id)? {
+            if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
                 let mp = self.writer.read().map_err(|e| {
                     log::error!("RwLock poisoned: {e}");
                     InoxSetError::Closed
@@ -560,7 +560,7 @@ impl InoxSet {
         }
 
         // Disabled mode: existing path.
-        let internal_id = match dict::lookup(self.catalog.db(), event, external_id)? {
+        let internal_id = match dict::lookup(self.catalog.db(), external_id)? {
             Some(id) => id,
             None => return Ok(false),
         };
@@ -661,7 +661,7 @@ impl InoxSet {
         if external_ids.is_empty() {
             return Ok(());
         }
-        let internal_ids = dict::batch_assign_or_get(self.catalog.db(), event, external_ids)?;
+        let internal_ids = dict::batch_assign_or_get(self.catalog.db(), external_ids)?;
         let mut bitmap = RoaringBitmap::new();
         for id in internal_ids {
             bitmap.insert(id);
@@ -681,7 +681,7 @@ impl InoxSet {
     pub fn get_ids(&self, event: &str, period: Period) -> Result<Vec<String>> {
         let bitmap = self.get(event, period)?;
         let internal_ids: Vec<u32> = bitmap.iter().collect();
-        let resolved = dict::batch_reverse_lookup(self.catalog.db(), event, &internal_ids)?;
+        let resolved = dict::batch_reverse_lookup(self.catalog.db(), &internal_ids)?;
         Ok(resolved.into_iter().flatten().collect())
     }
 
@@ -702,7 +702,7 @@ impl InoxSet {
         }
         let mut bits: Vec<u32> = Vec::new();
         for ext_id in external_ids {
-            if let Some(internal) = dict::lookup(self.catalog.db(), event, ext_id)? {
+            if let Some(internal) = dict::lookup(self.catalog.db(), ext_id)? {
                 bits.push(internal);
             }
         }

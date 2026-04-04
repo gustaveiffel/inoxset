@@ -530,3 +530,79 @@ fn corrupt_part_file_returns_error() {
     let result = s.get("x", Period::Day(2026, 3, 11));
     assert!(result.is_err());
 }
+
+// --- Dictionary Encoding Integration Tests ---
+
+#[test]
+fn dict_put_get_flush_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("data");
+
+    {
+        let store = InoxSet::builder().path(&path).open().unwrap();
+        store
+            .put_ids("audience", Period::Day(2026, 4, 1), &["usr-001", "usr-002", "usr-003"])
+            .unwrap();
+        store.flush().unwrap();
+        store.close().unwrap();
+    }
+
+    {
+        let store = InoxSet::builder().path(&path).open().unwrap();
+        let ids = store
+            .get_ids("audience", Period::Day(2026, 4, 1))
+            .unwrap();
+        let mut sorted = ids;
+        sorted.sort();
+        assert_eq!(sorted, vec!["usr-001", "usr-002", "usr-003"]);
+    }
+}
+
+#[test]
+fn dict_mixed_with_raw_bitmap() {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+
+    store
+        .put_ids("ev", Period::Day(2026, 4, 1), &["a", "b"])
+        .unwrap();
+
+    let mut bm = RoaringBitmap::new();
+    bm.insert(100);
+    store.put_bitmap("ev", Period::Day(2026, 4, 1), bm).unwrap();
+
+    let result = store.get("ev", Period::Day(2026, 4, 1)).unwrap();
+    assert_eq!(result.len(), 3);
+
+    let ids = store.get_ids("ev", Period::Day(2026, 4, 1)).unwrap();
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn dict_compaction_preserves_dictionary() {
+    let dir = TempDir::new().unwrap();
+    let store = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .open()
+        .unwrap();
+
+    store
+        .put_ids("seg", Period::Day(2026, 4, 1), &["x"])
+        .unwrap();
+    store.flush().unwrap();
+
+    store
+        .put_ids("seg", Period::Day(2026, 4, 1), &["y"])
+        .unwrap();
+    store.flush().unwrap();
+
+    store.compact().unwrap();
+
+    let ids = store.get_ids("seg", Period::Day(2026, 4, 1)).unwrap();
+    let mut sorted = ids;
+    sorted.sort();
+    assert_eq!(sorted, vec!["x", "y"]);
+}

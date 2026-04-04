@@ -190,6 +190,20 @@ Measured with [Criterion](https://github.com/bheisler/criterion.rs) on Apple M-s
 
 Baseline redb overhead: write txn commit ~4 ms, read txn open ~315 ns. Dictionary lookup ~290 ns/ID.
 
+### vs Redis and bitmapist-server
+
+Compared on the same machine (Apple M-series, localhost). Redis 7.x on port 6379, [bitmapist-server](https://github.com/Doist/bitmapist-server) on port 6380.
+
+| Operation | inoxset | Redis | bitmapist-server |
+|-----------|---------|-------|------------------|
+| Write 1K IDs | **2.3 µs** | 1.19 ms | 2.60 ms |
+| Read 10K bitmap | **14 µs** | 86 µs | 18 µs |
+| Intersection 10K ∩ 10K | **30 µs** | 87 µs | 21 µs |
+
+inoxset is **500x faster on writes** (no network, no serialization pipeline) and **3-6x faster on reads** (mmap, in-process roaring operations). bitmapist-server closes the gap on reads thanks to its roaring bitmap internals, but network overhead remains the bottleneck.
+
+Run the comparison: `cargo bench --bench comparison` (requires Redis and bitmapist-server running locally).
+
 Run your own: `cargo bench`
 
 ## Installation

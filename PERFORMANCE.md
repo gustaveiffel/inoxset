@@ -11,12 +11,12 @@ Detailed benchmark results, flamegraph analysis, and competitive comparison for 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
 | `put_bitmap` (1K bits) | 2.3 µs | In-memory accumulation |
-| `get` (1 part, mmap) | 14 µs | Memory-mapped read |
-| `get` (compacted, 100K bits) | 15 µs | Single merged part |
+| `get` (compacted, 10K bits) | **~800 ns** | Served from bitmap cache |
 | `put_ids` (1K string IDs) | 289 µs | Dictionary + bitmap |
 | `get_ids` (1K string IDs) | 360 µs | Bitmap + reverse dict |
 | `find_memberships` hit (600 checks) | **29 µs** | Inverted index, bloom+roaring+flat array |
 | `find_memberships` miss | **30 ns** | Bloom filter L1 rejects |
+| Intersection (10K ∩ 10K) | **784 ns** | Bitmap cache + Roaring AND |
 | `contains_id` | ~50 ns | Inverted index path |
 | `flush` (10ev × 100 periods) | 342 ms | Disk I/O bound |
 | `compact` (50p × 5 parts) | 190 ms | Merge + rewrite |
@@ -103,7 +103,9 @@ Compared on the same machine, localhost. Redis 7.x, [bitmapist-server](https://g
 
 | | inoxset | Redis (BITOP AND) | bitmapist-server | Factor |
 |---|---|---|---|---|
-| Latency | **30 µs** | 87 µs | 21 µs | **3x vs Redis** |
+| Latency | **784 ns** | 87 µs | 21 µs | **111x vs Redis, 27x vs bitmapist** |
+
+Bitmap cache eliminates deserialization: bitmaps are pre-loaded into RAM at flush time and served via `Arc<RoaringBitmap>`. The intersection itself (Roaring AND) takes ~300ns; the rest is two HashMap lookups + Arc clone.
 
 ### Reverse Membership (600 checks)
 
@@ -140,6 +142,15 @@ Key insight: `exists()` ≈ `get()` ≈ `contains_id()` in latency, proving that
 
 The inverted index hot path (bloom + binary search) is **invisible in the flamegraph** — too fast relative to setup/rebuild costs. redb operations appear only in the rebuild path (at flush time), not on the query path.
 
+### Intersection analysis
+
+Profiling the intersection path (get+get+AND) showed:
+- Pure Roaring AND: 295ns (~1% of total)
+- mmap + deserialize × 2: ~27µs (~93%)
+- Memory allocations: ~1µs (~6%)
+
+Fix: bitmap cache in ReadIndex pre-deserializes all bitmaps at flush time. `get()` serves from `Arc<RoaringBitmap>` cache — zero I/O, zero deserialization. Result: 27µs → 784ns (38x improvement).
+
 ---
 
 ## How to Reproduce
@@ -164,6 +175,7 @@ cargo bench --bench comparison
 
 ```bash
 cargo run --example profile_find --release
+cargo run --example profile_intersection --release
 ```
 
 ### Generate flamegraph (macOS, requires sudo for dtrace)
@@ -185,11 +197,12 @@ The standard benchmark scenario uses:
 
 ## Optimization History
 
-| Phase | Change | Hit (600) | Miss | Commit |
-|-------|--------|-----------|------|--------|
-| Baseline | Bitmap scan, per-file reads | 7.25 ms | 17 µs | — |
-| Phase 0 | ArcSwap ReadIndex (cache catalog in RAM) | 7.0 ms | 3.5 µs | `9e22d08` |
-| **Inverted Index** | Bloom L1 + Roaring L2 + flat array | **29 µs** | **30 ns** | `0a0fade` |
+| Phase | Change | find_memberships (600) | Intersection 10K∩10K | Commit |
+|-------|--------|----------------------|---------------------|--------|
+| Baseline | Bitmap scan, per-file reads | 7.25 ms | 30 µs | — |
+| Phase 0 | ArcSwap ReadIndex (cache catalog) | 7.0 ms | 30 µs | `9e22d08` |
+| Inverted Index | Bloom L1 + Roaring L2 + flat array | **29 µs** | 30 µs | `0a0fade` |
+| **Bitmap Cache** | Pre-deserialized bitmaps in ReadIndex | **29 µs** | **784 ns** | `5377766` |
 
 ### What didn't work
 

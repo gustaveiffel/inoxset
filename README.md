@@ -216,10 +216,10 @@ Compared on the same machine (Apple M-series, localhost). Redis 7.x on port 6379
 |-----------|---------|-------|------------------|
 | Write 1K IDs | **2.3 µs** | 1.19 ms | 2.60 ms |
 | Read 10K bitmap | **14 µs** | 86 µs | 18 µs |
-| Intersection 10K ∩ 10K | **30 µs** | 87 µs | 21 µs |
+| Intersection 10K ∩ 10K | **784 ns** | 87 µs | 21 µs |
 | Reverse lookup (600 checks) | **29 µs** | 721 µs | 1.54 ms |
 
-inoxset is **500x faster on writes** (no network, no serialization pipeline) and **3-6x faster on reads** (mmap, in-process roaring operations). bitmapist-server closes the gap on reads thanks to its roaring bitmap internals, but network overhead remains the bottleneck.
+inoxset is **500x faster on writes** (no network, no serialization pipeline), **110x faster on intersections** (bitmap cache, zero deserialization), and **25x faster on reverse lookups** (inverted index). The embedded advantage eliminates all network overhead.
 
 Run the comparison: `cargo bench --bench comparison` (requires Redis and bitmapist-server running locally).
 

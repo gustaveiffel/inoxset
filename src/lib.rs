@@ -193,6 +193,80 @@ impl InoxSet {
         Ok(())
     }
 
+    /// Deletes a single period's data for the given event.
+    ///
+    /// Removes all data parts, delta parts, and period state from the catalog
+    /// and deletes the corresponding files from disk. The event registration
+    /// itself is preserved.
+    ///
+    /// Also clears any unflushed in-memory data for the period.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    /// Returns an error on catalog or file I/O failure.
+    pub fn delete_period(&self, event: &str, period: Period) -> Result<()> {
+        self.check_writable()?;
+        validate_event_name(event)?;
+
+        // Clear from mempart.
+        {
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            mp.bitmaps.remove(&(event.to_string(), period));
+            mp.deltas.remove(&(event.to_string(), period));
+        }
+
+        // Look up event config to build the catalog key.
+        let config = match self.catalog.get_event(event)? {
+            Some(c) => c,
+            None => return Ok(()), // Event not registered → nothing to delete.
+        };
+
+        let cat_key = period::catalog_key(event, config.finest_granularity, &period);
+        let parts = self.catalog.delete_period_returning_parts(&cat_key)?;
+        for part in &parts {
+            if part.file_path.exists() {
+                let _ = part_store::delete_part(&part.file_path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retains only the periods matching the predicate, deleting the rest.
+    ///
+    /// Calls [`delete_period`](Self::delete_period) for each period where
+    /// `keep` returns `false`. Returns the number of periods deleted.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use inoxset::InoxSet;
+    /// # use inoxset::types::Period;
+    /// # let store = InoxSet::builder().path("/tmp/ex").open().unwrap();
+    /// // Keep only the last 90 days
+    /// let cutoff = Period::Day(2026, 1, 1);
+    /// let deleted = store.retain_periods("logins", |p| *p >= cutoff).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn retain_periods(&self, event: &str, keep: impl Fn(&Period) -> bool) -> Result<u32> {
+        self.check_writable()?;
+        let periods = self.list_periods(event)?;
+        let mut deleted = 0u32;
+        for period in periods {
+            if !keep(&period) {
+                self.delete_period(event, period)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Looks up an event by name, auto-registering it with defaults if it
     /// doesn't exist.
     ///
@@ -1959,5 +2033,99 @@ mod tests {
                 Period::Day(2026, 3, 12),
             ]
         );
+    }
+
+    #[test]
+    fn delete_period_removes_data_and_files() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let mut bm = RoaringBitmap::new();
+        bm.extend(0..100);
+
+        store
+            .put_bitmap("visits", Period::Day(2026, 3, 10), bm.clone())
+            .unwrap();
+        store
+            .put_bitmap("visits", Period::Day(2026, 3, 11), bm.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        // Delete one period.
+        store
+            .delete_period("visits", Period::Day(2026, 3, 10))
+            .unwrap();
+
+        // Deleted period returns empty bitmap.
+        let got = store.get("visits", Period::Day(2026, 3, 10)).unwrap();
+        assert!(got.is_empty());
+
+        // Other period is intact.
+        let got = store.get("visits", Period::Day(2026, 3, 11)).unwrap();
+        assert_eq!(got.len(), 100);
+
+        // list_periods reflects the deletion.
+        let periods = store.list_periods("visits").unwrap();
+        assert_eq!(periods, vec![Period::Day(2026, 3, 11)]);
+    }
+
+    #[test]
+    fn retain_periods_keeps_matching() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+
+        for d in 1..=5 {
+            store
+                .put_bitmap("logins", Period::Day(2026, 3, d), bm.clone())
+                .unwrap();
+        }
+        store.flush().unwrap();
+
+        // Keep only days >= 4.
+        let deleted = store
+            .retain_periods("logins", |p| *p >= Period::Day(2026, 3, 4))
+            .unwrap();
+        assert_eq!(deleted, 3);
+
+        let periods = store.list_periods("logins").unwrap();
+        assert_eq!(
+            periods,
+            vec![Period::Day(2026, 3, 4), Period::Day(2026, 3, 5)]
+        );
+    }
+
+    #[test]
+    fn delete_period_clears_unflushed_mempart() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let mut bm = RoaringBitmap::new();
+        bm.extend(0..50);
+
+        // Write but don't flush.
+        store
+            .put_bitmap("events", Period::Day(2026, 4, 1), bm)
+            .unwrap();
+
+        // Delete the unflushed period.
+        store
+            .delete_period("events", Period::Day(2026, 4, 1))
+            .unwrap();
+
+        // Should be empty even without flush.
+        let got = store.get("events", Period::Day(2026, 4, 1)).unwrap();
+        assert!(got.is_empty());
     }
 }

@@ -200,9 +200,7 @@ fn bench_redb_txn_baseline(c: &mut Criterion) {
             let txn = db.begin_write().unwrap();
             {
                 let mut table = txn.open_table(table_def).unwrap();
-                table
-                    .insert("key", black_box(b"value".as_slice()))
-                    .unwrap();
+                table.insert("key", black_box(b"value".as_slice())).unwrap();
             }
             txn.commit().unwrap();
         })

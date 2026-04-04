@@ -705,6 +705,55 @@ impl Catalog {
         Ok(parts)
     }
 
+    /// Deletes a single period's data and delta parts from the catalog in a
+    /// single atomic transaction, returning the [`Part`] structs that were
+    /// removed.
+    ///
+    /// Removes entries from `period_parts`, `period_deltas`, `period_state`,
+    /// and `parts` for the given catalog key. The event registration itself
+    /// is **not** removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on redb I/O failure or data corruption.
+    pub fn delete_period_returning_parts(&self, cat_key: &str) -> crate::Result<Vec<Part>> {
+        let txn = self.db.begin_write()?;
+        let mut parts: Vec<Part> = Vec::new();
+        {
+            let mut pp_table = txn.open_table(PERIOD_PARTS)?;
+            let mut pd_table = txn.open_table(PERIOD_DELTAS)?;
+            let mut ps_table = txn.open_table(PERIOD_STATE)?;
+            let mut parts_table = txn.open_table(PARTS)?;
+
+            // Collect data part IDs.
+            let mut part_ids: Vec<u64> = Vec::new();
+            if let Some(guard) = pp_table.remove(cat_key)? {
+                let ids = deserialize_u64_vec(cat_key, guard.value())?;
+                part_ids.extend(ids);
+            }
+
+            // Collect delta part IDs.
+            if let Some(guard) = pd_table.remove(cat_key)? {
+                let ids = deserialize_u64_vec(cat_key, guard.value())?;
+                part_ids.extend(ids);
+            }
+
+            // Remove period state.
+            ps_table.remove(cat_key)?;
+
+            // Read then remove each Part entry.
+            for pid in part_ids {
+                let ctx = format!("part_id={pid}");
+                if let Some(guard) = parts_table.remove(pid)? {
+                    let part = deserialize_part(&ctx, guard.value())?;
+                    parts.push(part);
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(parts)
+    }
+
     // ─── Part IDs ─────────────────────────────────────────────────────────────
 
     /// Allocates the next monotonically-increasing part ID and persists the

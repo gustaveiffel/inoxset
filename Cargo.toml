@@ -1,6 +1,6 @@
 [package]
 name = "inoxset"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2021"
 description = "Embeddable set engine — power segmentation, analytics, and AI recall in real time"
 license = "MIT"

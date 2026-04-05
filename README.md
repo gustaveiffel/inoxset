@@ -205,15 +205,36 @@ let bm = tokio::task::spawn_blocking(move || {
 | `list_events` / `list_periods` | Discover stored data |
 | `health` | Operational snapshot |
 
+### Export
+
+| Method | Description |
+|--------|-------------|
+| `export_u32_vec` | Sorted u32 array from a bitmap |
+| `serialize_portable` | CRoaring portable bytes (compatible with Java, Go, ClickHouse) |
+| `query_export` | SetExpr → sorted u32 array |
+| `query_serialize` | SetExpr → CRoaring bytes |
+| `export_ids` / `export_uuids` | Sorted string/UUID export |
+
+### Standalone Dictionary
+
+```rust
+use inoxset::dictionary::Dictionary;
+
+let dict = Dictionary::open("data/my_store/catalog.mdb")?;
+let id = dict.get_or_assign("user-abc")?;    // u32
+let name = dict.resolve(id)?;                 // Option<String>
+let batch = dict.get_or_assign_batch(&["a", "b", "c"])?; // Vec<u32>
+```
+
 ## Installation
 
 ```toml
 [dependencies]
-inoxset = "0.1.0-alpha.3"
+inoxset = "0.1.0-alpha.4"
 roaring = "0.10"
 
 # Optional: UUID support
-inoxset = { version = "0.1.0-alpha.3", features = ["uuid"] }
+inoxset = { version = "0.1.0-alpha.4", features = ["uuid"] }
 ```
 
 **MSRV:** Rust 1.75+
@@ -309,7 +330,7 @@ inoxset builds on ideas from several systems. We are grateful to their authors a
 
 ## Status
 
-Alpha. 211 tests (unit, integration, property-based). API is functional but may change before 1.0. Not yet battle-tested in production.
+Alpha. 233 tests (unit, integration, property-based). API is functional but may change before 1.0. Not yet battle-tested in production.
 
 ## License
 

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.0-alpha.4] — 2026-04-05
+
+### Added
+
+- **Export API** — `serialize_portable()` (CRoaring bytes), `export_u32_vec()`, `query_export()`, `query_serialize()`, `export_ids()`, `export_uuids()`.
+- **Standalone Dictionary module** — `Dictionary` struct importable without full store. Methods: `get_or_assign`, `get_or_assign_batch`, `lookup`, `lookup_batch`, `contains`, `resolve`, `resolve_batch`, `delete`, `len`, `is_empty`. UUID batch support.
+- ClickHouse integration examples (internal): CRoaring compat test, segment sync, scale test.
+- Production scale validation: 8M profiles, 50 segments, 90K QPS on 8 cores.
+- QPS stress test with single-thread and multi-thread benchmarks.
+
+### Fixed
+
+- Dictionary doc: clarified store must be closed before opening standalone Dictionary on same path.
+- `serialize_portable` doc: noted run containers not emitted by Rust serializer.
+- `export_ids` doc: clarified lexicographic sort order.
+- `delete` doc: noted u32 slot non-recycling.
+- Empty bitmap edge case test for export API.
+
 ## [0.1.0-alpha.3] — 2026-04-05
 
 ### Added

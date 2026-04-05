@@ -7,6 +7,7 @@ pub(crate) mod bloom;
 pub mod builder;
 pub mod catalog;
 pub mod dict;
+pub mod dictionary;
 pub mod error;
 pub(crate) mod inverted;
 pub mod mempart;
@@ -2083,6 +2084,91 @@ impl InoxSet {
         Ok(())
     }
 
+    // ─── Export API ──────────────────────────────────────────────────────
+
+    /// Exports a bitmap as a sorted `Vec<u32>`.
+    ///
+    /// Useful for passing ID lists to external systems (ClickHouse IN clause,
+    /// batch API calls, etc.).
+    pub fn export_u32_vec(bitmap: &RoaringBitmap) -> Vec<u32> {
+        bitmap.iter().collect()
+    }
+
+    /// Serializes a bitmap in the CRoaring portable format.
+    ///
+    /// The output uses the CRoaring portable format (cookie `12346`),
+    /// compatible with Java's RoaringBitmap, Go's roaring, and ClickHouse.
+    ///
+    /// Note: the Rust serializer does not emit run containers, so output
+    /// may be slightly larger than equivalent serialization from Java/Go/C.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails (should not happen in practice).
+    pub fn serialize_portable(bitmap: &RoaringBitmap) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(bitmap.serialized_size());
+        bitmap
+            .serialize_into(&mut buf)
+            .map_err(|e| InoxSetError::BitmapIo {
+                path: std::path::PathBuf::from("<serialize>"),
+                source: e,
+            })?;
+        Ok(buf)
+    }
+
+    /// Exports the resolved string IDs for an event and period.
+    ///
+    /// Convenience method equivalent to [`get_ids`](Self::get_ids) but
+    /// returns a lexicographically sorted `Vec<String>` for deterministic output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn export_ids(&self, event: &str, period: Period) -> Result<Vec<String>> {
+        let mut ids = self.get_ids(event, period)?;
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Exports resolved UUIDs for an event and period (sorted).
+    ///
+    /// Requires the `uuid` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    #[cfg(feature = "uuid")]
+    pub fn export_uuids(&self, event: &str, period: Period) -> Result<Vec<Uuid>> {
+        let mut uuids = self.get_uuids(event, period)?;
+        uuids.sort();
+        Ok(uuids)
+    }
+
+    /// Resolves a set expression and exports the result as a sorted u32 array.
+    ///
+    /// Combines [`query`](Self::query) + [`export_u32_vec`](Self::export_u32_vec).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn query_export(&self, expr: &types::SetExpr) -> Result<Vec<u32>> {
+        let bm = self.query(expr)?;
+        Ok(Self::export_u32_vec(&bm))
+    }
+
+    /// Resolves a set expression and serializes the result in CRoaring
+    /// portable format.
+    ///
+    /// Combines [`query`](Self::query) + [`serialize_portable`](Self::serialize_portable).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn query_serialize(&self, expr: &types::SetExpr) -> Result<Vec<u8>> {
+        let bm = self.query(expr)?;
+        Self::serialize_portable(&bm)
+    }
+
     /// Returns an operational health snapshot.
     ///
     /// # Errors
@@ -3533,5 +3619,91 @@ mod tests {
         );
         let result = store.query(&expr).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn export_u32_vec_sorted() {
+        let mut bm = RoaringBitmap::new();
+        bm.insert(100);
+        bm.insert(1);
+        bm.insert(50);
+        let v = InoxSet::export_u32_vec(&bm);
+        assert_eq!(v, vec![1, 50, 100]);
+    }
+
+    #[test]
+    fn serialize_portable_roundtrip() {
+        let mut bm = RoaringBitmap::new();
+        for i in 0..10_000 {
+            bm.insert(i);
+        }
+        let bytes = InoxSet::serialize_portable(&bm).unwrap();
+        let restored = RoaringBitmap::deserialize_from(bytes.as_slice()).unwrap();
+        assert_eq!(bm, restored);
+    }
+
+    #[test]
+    fn export_ids_sorted() {
+        let (store, _dir) = test_store();
+        store
+            .put_ids("seg", Period::Day(2026, 4, 1), &["charlie", "alice", "bob"])
+            .unwrap();
+        store.flush().unwrap();
+        let ids = store.export_ids("seg", Period::Day(2026, 4, 1)).unwrap();
+        assert_eq!(ids, vec!["alice", "bob", "charlie"]);
+    }
+
+    #[test]
+    fn query_export_returns_sorted_u32s() {
+        let (store, _dir) = test_store();
+        let mut bm = RoaringBitmap::new();
+        for i in (0..100).step_by(3) {
+            bm.insert(i);
+        }
+        store
+            .put_bitmap("seg", Period::Day(2026, 4, 1), bm.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let expr = types::SetExpr::Ref {
+            event: "seg".into(),
+            period: Period::Day(2026, 4, 1),
+        };
+        let exported = store.query_export(&expr).unwrap();
+        assert_eq!(exported.len(), bm.len() as usize);
+        // Verify sorted.
+        for w in exported.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn query_serialize_is_valid_croaring() {
+        let (store, _dir) = test_store();
+        let mut bm = RoaringBitmap::new();
+        for i in 0..5000 {
+            bm.insert(i);
+        }
+        store
+            .put_bitmap("seg", Period::Day(2026, 4, 1), bm.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let expr = types::SetExpr::Ref {
+            event: "seg".into(),
+            period: Period::Day(2026, 4, 1),
+        };
+        let bytes = store.query_serialize(&expr).unwrap();
+        let restored = RoaringBitmap::deserialize_from(bytes.as_slice()).unwrap();
+        assert_eq!(bm, restored);
+    }
+
+    #[test]
+    fn export_empty_bitmap() {
+        let empty = RoaringBitmap::new();
+        assert!(InoxSet::export_u32_vec(&empty).is_empty());
+        let bytes = InoxSet::serialize_portable(&empty).unwrap();
+        let restored = RoaringBitmap::deserialize_from(bytes.as_slice()).unwrap();
+        assert!(restored.is_empty());
     }
 }

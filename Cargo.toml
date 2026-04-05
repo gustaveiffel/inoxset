@@ -29,6 +29,7 @@ redis = "0.32.2"
 dashmap = "6.1.0"
 heed = "0.22.0"
 redb = "~1.4"
+hex = "0.4.3"
 
 [profile.release]
 debug = true

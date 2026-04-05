@@ -616,6 +616,74 @@ impl InoxSet {
         self.contains_bit(event, period, internal_id)
     }
 
+    // ─── Batch API ────────────────────────────────────────────────────
+
+    /// Batch reverse membership lookup for multiple external IDs.
+    ///
+    /// Returns one `Vec<(String, Period)>` per input ID, in the same order.
+    /// Currently a convenience wrapper — each ID is looked up independently.
+    /// For `contains_batch` (which shares a single bitmap snapshot), prefer
+    /// [`contains_ids_batch`](Self::contains_ids_batch) when checking against
+    /// a single (event, period).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn find_memberships_batch(
+        &self,
+        external_ids: &[&str],
+    ) -> Result<Vec<Vec<(String, Period)>>> {
+        self.check_closed()?;
+        let mut results = Vec::with_capacity(external_ids.len());
+        for &id in external_ids {
+            results.push(self.find_memberships(id)?);
+        }
+        Ok(results)
+    }
+
+    /// Batch membership check for multiple external IDs against a single
+    /// (event, period).
+    ///
+    /// Returns a `Vec<bool>` in the same order as the input IDs.
+    /// Uses [`get_shared`](Self::get_shared) internally — zero-copy when
+    /// mempart is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn contains_ids_batch(
+        &self,
+        event: &str,
+        period: Period,
+        external_ids: &[&str],
+    ) -> Result<Vec<bool>> {
+        self.check_closed()?;
+        let bitmap = self.get_shared(event, period)?;
+        let mut results = Vec::with_capacity(external_ids.len());
+        for &ext_id in external_ids {
+            let present = match dict::lookup(&self.catalog, ext_id)? {
+                Some(internal_id) => bitmap.contains(internal_id),
+                None => false,
+            };
+            results.push(present);
+        }
+        Ok(results)
+    }
+
+    /// Batch membership check using raw u32 IDs against a single (event, period).
+    ///
+    /// Skips dictionary lookup — use when you already have internal IDs.
+    /// Returns a `Vec<bool>` in the same order as the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn contains_batch(&self, event: &str, period: Period, ids: &[u32]) -> Result<Vec<bool>> {
+        self.check_closed()?;
+        let bitmap = self.get_shared(event, period)?;
+        Ok(ids.iter().map(|id| bitmap.contains(*id)).collect())
+    }
+
     /// Checks whether a raw u32 value is present in the bitmap for an event
     /// and period, using zero-copy serialized checks on disk parts.
     fn contains_bit(&self, event: &str, period: Period, value: u32) -> Result<bool> {
@@ -1175,6 +1243,57 @@ impl InoxSet {
 
     // ─── Task 15: Read Path ──────────────────────────────────────────────────
 
+    /// Returns a shared reference to the cached bitmap for an event and period.
+    ///
+    /// **Zero-copy** when the mempart is empty (common case after flush):
+    /// returns `Arc<RoaringBitmap>` directly from the bitmap cache without
+    /// cloning. Falls back to a new Arc wrapping the merged result when
+    /// mempart has unflushed data.
+    ///
+    /// Use this for read-only operations (cardinality, contains, intersection)
+    /// where you don't need to mutate the bitmap. For set operations that
+    /// produce a new bitmap, use [`get`](Self::get).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn get_shared(&self, event: &str, period: Period) -> Result<Arc<RoaringBitmap>> {
+        self.check_closed()?;
+
+        // Two-phase read: mempart (under RwLock) then cache (under ArcSwap).
+        // Safe despite no single lock: OR and ANDNOT are idempotent, so stale
+        // mempart data merged into an already-up-to-date cache after a
+        // concurrent flush produces the correct result.
+        let (mp_bitmap, mp_delta) = {
+            let mp = self.writer.read().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            (mp.get_bitmap(event, &period), mp.get_delta(event, &period))
+        };
+
+        let ridx = self.ridx.load();
+        let key = (event.to_string(), period);
+        if let Some(cached) = ridx.bitmap_cache.get(&key) {
+            // Zero-copy fast path: no mempart data.
+            if mp_bitmap.is_none() && mp_delta.is_none() {
+                return Ok(Arc::clone(cached));
+            }
+            // Merge with mempart.
+            let mut result = cached.as_ref().clone();
+            if let Some(mp_bm) = mp_bitmap {
+                result |= mp_bm.as_ref();
+            }
+            if let Some(mp_d) = mp_delta {
+                result -= mp_d.as_ref();
+            }
+            return Ok(Arc::new(result));
+        }
+
+        // No cache hit — fall back to full disk read.
+        Ok(Arc::new(self.get(event, period)?))
+    }
+
     /// Retrieves the merged bitmap for an event and period.
     ///
     /// The result is the OR of all flushed data parts and the in-memory
@@ -1202,6 +1321,12 @@ impl InoxSet {
             let ridx = self.ridx.load();
             let key = (event.to_string(), period);
             if let Some(cached) = ridx.bitmap_cache.get(&key) {
+                // If mempart has no data, clone from cache (unavoidable since
+                // we return owned RoaringBitmap). For zero-copy access, use
+                // get_shared() which returns Arc<RoaringBitmap>.
+                if mp_bitmap.is_none() && mp_delta.is_none() {
+                    return Ok(cached.as_ref().clone());
+                }
                 let mut result = cached.as_ref().clone();
                 // OR mempart bitmap (unflushed data).
                 if let Some(mp_bm) = mp_bitmap {
@@ -1385,8 +1510,8 @@ impl InoxSet {
         event_b: &str,
         period_b: Period,
     ) -> Result<u64> {
-        let a = self.get(event_a, period_a)?;
-        let b = self.get(event_b, period_b)?;
+        let a = self.get_shared(event_a, period_a)?;
+        let b = self.get_shared(event_b, period_b)?;
         Ok(a.intersection_len(&b))
     }
 
@@ -1405,8 +1530,8 @@ impl InoxSet {
         event_b: &str,
         period_b: Period,
     ) -> Result<u64> {
-        let a = self.get(event_a, period_a)?;
-        let b = self.get(event_b, period_b)?;
+        let a = self.get_shared(event_a, period_a)?;
+        let b = self.get_shared(event_b, period_b)?;
         Ok(a.union_len(&b))
     }
 
@@ -3705,5 +3830,87 @@ mod tests {
         let bytes = InoxSet::serialize_portable(&empty).unwrap();
         let restored = RoaringBitmap::deserialize_from(bytes.as_slice()).unwrap();
         assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn find_memberships_batch_returns_per_id_results() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .index_freshness(crate::types::IndexFreshness::OnFlush)
+            .open()
+            .unwrap();
+
+        store
+            .put_ids("seg_a", Period::Day(2026, 4, 1), &["alice", "bob"])
+            .unwrap();
+        store
+            .put_ids("seg_b", Period::Day(2026, 4, 1), &["alice"])
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .find_memberships_batch(&["alice", "bob", "unknown"])
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].len(), 2); // alice in seg_a + seg_b
+        assert_eq!(results[1].len(), 1); // bob in seg_a only
+        assert!(results[2].is_empty()); // unknown
+    }
+
+    #[test]
+    fn contains_ids_batch_checks_multiple() {
+        let (store, _dir) = test_store();
+        store
+            .put_ids("seg", Period::Day(2026, 4, 1), &["alice", "bob", "charlie"])
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .contains_ids_batch(
+                "seg",
+                Period::Day(2026, 4, 1),
+                &["alice", "unknown", "charlie"],
+            )
+            .unwrap();
+        assert_eq!(results, vec![true, false, true]);
+    }
+
+    #[test]
+    fn contains_batch_raw_u32() {
+        let (store, _dir) = test_store();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(10);
+        bm.insert(20);
+        bm.insert(30);
+        store
+            .put_bitmap("seg", Period::Day(2026, 4, 1), bm)
+            .unwrap();
+        store.flush().unwrap();
+
+        let results = store
+            .contains_batch("seg", Period::Day(2026, 4, 1), &[10, 15, 20, 25, 30])
+            .unwrap();
+        assert_eq!(results, vec![true, false, true, false, true]);
+    }
+
+    #[test]
+    fn get_shared_returns_arc_without_clone_overhead() {
+        let (store, _dir) = test_store();
+        let mut bm = RoaringBitmap::new();
+        for i in 0..10_000 {
+            bm.insert(i);
+        }
+        store
+            .put_bitmap("seg", Period::Day(2026, 4, 1), bm.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let arc1 = store.get_shared("seg", Period::Day(2026, 4, 1)).unwrap();
+        let arc2 = store.get_shared("seg", Period::Day(2026, 4, 1)).unwrap();
+        // Both should point to the same underlying data (same Arc).
+        assert_eq!(arc1.len(), 10_000);
+        assert_eq!(arc2.len(), 10_000);
+        assert!(Arc::ptr_eq(&arc1, &arc2));
     }
 }

@@ -1,14 +1,19 @@
 [package]
 name = "inoxset"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2021"
 description = "Embeddable set engine — power segmentation, analytics, and AI recall in real time"
 license = "MIT"
 rust-version = "1.75"
 
+[features]
+default = []
+uuid = ["dep:uuid"]
+
 [dependencies]
 roaring = "0.10"
 heed = "0.22.0"
+uuid = { version = "1", optional = true, features = ["v4", "v7"] }
 memmap2 = "0.9"
 thiserror = "1"
 log = "0.4"

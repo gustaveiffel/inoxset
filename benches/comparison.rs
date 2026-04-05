@@ -217,6 +217,21 @@ fn bench_intersection(c: &mut Criterion) {
                 black_box(&a & &b);
             })
         });
+
+        group.bench_function("inoxset/intersect_cardinality", |b| {
+            b.iter(|| {
+                black_box(
+                    store
+                        .intersect_cardinality(
+                            "a",
+                            Period::Day(2026, 3, 11),
+                            "b",
+                            Period::Day(2026, 3, 11),
+                        )
+                        .unwrap(),
+                );
+            })
+        });
     }
 
     // Redis: BITOP AND

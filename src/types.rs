@@ -330,6 +330,53 @@ impl Membership {
     }
 }
 
+/// Declarative set expression for composable segment algebra.
+///
+/// Enables queries like "active_7d AND premium AND NOT churned" without
+/// manually loading and combining bitmaps.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use inoxset::types::{SetExpr, Period};
+///
+/// let expr = SetExpr::and(
+///     SetExpr::Ref { event: "active".into(), period: Period::Day(2026, 4, 1) },
+///     SetExpr::diff(
+///         SetExpr::Ref { event: "premium".into(), period: Period::Static },
+///         SetExpr::Ref { event: "churned".into(), period: Period::Static },
+///     ),
+/// );
+/// ```
+#[derive(Debug, Clone)]
+pub enum SetExpr {
+    /// Reference a stored event + period.
+    Ref { event: String, period: Period },
+    /// Intersection (A ∩ B).
+    And(Box<SetExpr>, Box<SetExpr>),
+    /// Union (A ∪ B).
+    Or(Box<SetExpr>, Box<SetExpr>),
+    /// Difference (A \ B).
+    Diff(Box<SetExpr>, Box<SetExpr>),
+}
+
+impl SetExpr {
+    /// Convenience constructor for intersection.
+    pub fn and(a: SetExpr, b: SetExpr) -> Self {
+        Self::And(Box::new(a), Box::new(b))
+    }
+
+    /// Convenience constructor for union.
+    pub fn or(a: SetExpr, b: SetExpr) -> Self {
+        Self::Or(Box::new(a), Box::new(b))
+    }
+
+    /// Convenience constructor for difference.
+    pub fn diff(a: SetExpr, b: SetExpr) -> Self {
+        Self::Diff(Box::new(a), Box::new(b))
+    }
+}
+
 /// A single entry in an inverted index mapping user ID hashes to bitmap locations.
 ///
 /// Each entry stores the hash of an external ID, a byte offset into the bitmap data,

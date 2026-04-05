@@ -26,6 +26,9 @@ use arc_swap::ArcSwap;
 
 use roaring::RoaringBitmap;
 
+#[cfg(feature = "uuid")]
+use uuid::Uuid;
+
 use crate::catalog::Catalog;
 use crate::error::{validate_event_name, InoxSetError};
 use crate::mempart::MemPartSnapshot;
@@ -792,6 +795,96 @@ impl InoxSet {
         Ok(count)
     }
 
+    // ─── UUID API (feature-gated) ──────────────────────────────────────────
+
+    /// Writes a set of UUIDs for the given event and period.
+    ///
+    /// UUIDs are stored as their string representation in the global dictionary.
+    /// Supports UUID v4 and v7 (or any version).
+    #[cfg(feature = "uuid")]
+    pub fn put_uuids(&self, event: &str, period: Period, ids: &[Uuid]) -> Result<()> {
+        self.check_writable()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let internal_ids = dict::batch_assign_or_get_uuids(&self.catalog, ids)?;
+        let mut bitmap = RoaringBitmap::new();
+        for id in internal_ids {
+            bitmap.insert(id);
+        }
+        self.put_bitmap(event, period, bitmap)
+    }
+
+    /// Reads the UUIDs stored for the given event and period.
+    ///
+    /// IDs that cannot be resolved back to a UUID (e.g., deleted from the
+    /// dictionary or originally stored as plain strings) are silently omitted.
+    /// The returned Vec may have fewer elements than the bitmap cardinality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    #[cfg(feature = "uuid")]
+    pub fn get_uuids(&self, event: &str, period: Period) -> Result<Vec<Uuid>> {
+        let bitmap = self.get(event, period)?;
+        let internal_ids: Vec<u32> = bitmap.iter().collect();
+        let resolved = dict::batch_reverse_lookup_uuids(&self.catalog, &internal_ids)?;
+        Ok(resolved.into_iter().flatten().collect())
+    }
+
+    /// Removes UUIDs from the given event and period via delta tombstones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    #[cfg(feature = "uuid")]
+    pub fn remove_uuids(&self, event: &str, period: Period, ids: &[Uuid]) -> Result<()> {
+        self.check_writable()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut bits: Vec<u32> = Vec::new();
+        for id in ids {
+            if let Some(internal) = dict::lookup_uuid(&self.catalog, id)? {
+                bits.push(internal);
+            }
+        }
+        if bits.is_empty() {
+            return Ok(());
+        }
+        self.remove_bits(event, period, &bits)
+    }
+
+    /// GDPR erasure for a UUID entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    #[cfg(feature = "uuid")]
+    pub fn delete_entity_uuid(&self, id: &Uuid) -> Result<u32> {
+        self.delete_entity(&id.to_string())
+    }
+
+    /// Reverse membership lookup for a UUID entity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    #[cfg(feature = "uuid")]
+    pub fn find_memberships_uuid(&self, id: &Uuid) -> Result<Vec<(String, Period)>> {
+        self.find_memberships(&id.to_string())
+    }
+
+    /// Check if a UUID entity is in a specific event and period.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    #[cfg(feature = "uuid")]
+    pub fn contains_uuid(&self, event: &str, period: Period, id: &Uuid) -> Result<bool> {
+        self.contains_id(event, period, &id.to_string())
+    }
+
     /// Looks up an event by name, auto-registering it with defaults if it
     /// doesn't exist.
     ///
@@ -1274,6 +1367,182 @@ impl InoxSet {
     pub fn exists(&self, event: &str, period: Period) -> Result<bool> {
         let bm = self.get(event, period)?;
         Ok(!bm.is_empty())
+    }
+
+    /// Returns the cardinality of the intersection of two bitmaps without
+    /// allocating an intermediate bitmap.
+    ///
+    /// Equivalent to `(get(a) & get(b)).len()` but avoids the allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn intersect_cardinality(
+        &self,
+        event_a: &str,
+        period_a: Period,
+        event_b: &str,
+        period_b: Period,
+    ) -> Result<u64> {
+        let a = self.get(event_a, period_a)?;
+        let b = self.get(event_b, period_b)?;
+        Ok(a.intersection_len(&b))
+    }
+
+    /// Returns the cardinality of the union of two bitmaps without
+    /// allocating an intermediate bitmap.
+    ///
+    /// Equivalent to `(get(a) | get(b)).len()` but avoids the allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn union_cardinality(
+        &self,
+        event_a: &str,
+        period_a: Period,
+        event_b: &str,
+        period_b: Period,
+    ) -> Result<u64> {
+        let a = self.get(event_a, period_a)?;
+        let b = self.get(event_b, period_b)?;
+        Ok(a.union_len(&b))
+    }
+
+    /// Returns the cardinality for each period in a range, without
+    /// materializing the full bitmaps when possible.
+    ///
+    /// For compacted periods with a cached bitmap, this reads the `.len()`
+    /// directly from the bitmap cache (O(1) per period). Returns only
+    /// periods that have data (empty periods are omitted).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn cardinality_range(
+        &self,
+        event: &str,
+        start: Period,
+        end: Period,
+    ) -> Result<Vec<(Period, u64)>> {
+        self.check_closed()?;
+        let periods = Self::enumerate_periods(start, end);
+        const MAX_RANGE_PERIODS: usize = 366 * 24;
+        if periods.len() > MAX_RANGE_PERIODS {
+            return Err(InoxSetError::Configuration(format!(
+                "cardinality_range spans {} periods, limit is {}",
+                periods.len(),
+                MAX_RANGE_PERIODS,
+            )));
+        }
+
+        let mut results = Vec::with_capacity(periods.len());
+
+        for p in periods {
+            // Use self.get() which merges bitmap cache + mempart correctly.
+            // The bitmap cache makes this fast (~228ns) for flushed periods.
+            let bm = self.get(event, p)?;
+            if !bm.is_empty() {
+                results.push((p, bm.len()));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Evaluates a set expression and returns the resulting bitmap.
+    ///
+    /// Short-circuits on empty intermediate results for `And` expressions.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use inoxset::*;
+    /// # use inoxset::types::{SetExpr, Period};
+    /// # let store = InoxSet::builder().path("/tmp/ex").open().unwrap();
+    /// let result = store.query(&SetExpr::and(
+    ///     SetExpr::Ref { event: "active".into(), period: Period::Day(2026, 4, 1) },
+    ///     SetExpr::Ref { event: "premium".into(), period: Period::Static },
+    /// )).unwrap();
+    /// println!("{} users match", result.len());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn query(&self, expr: &types::SetExpr) -> Result<RoaringBitmap> {
+        use types::SetExpr;
+        match expr {
+            SetExpr::Ref { event, period } => self.get(event, *period),
+            SetExpr::And(a, b) => {
+                let left = self.query(a)?;
+                if left.is_empty() {
+                    return Ok(left); // short-circuit
+                }
+                let right = self.query(b)?;
+                Ok(&left & &right)
+            }
+            SetExpr::Or(a, b) => {
+                let left = self.query(a)?;
+                let right = self.query(b)?;
+                Ok(&left | &right)
+            }
+            SetExpr::Diff(a, b) => {
+                let left = self.query(a)?;
+                if left.is_empty() {
+                    return Ok(left); // short-circuit
+                }
+                let right = self.query(b)?;
+                Ok(left - right)
+            }
+        }
+    }
+
+    /// Evaluates a set expression and returns only the cardinality.
+    ///
+    /// For leaf `And` expressions where both children are `Ref` nodes,
+    /// uses `intersection_len` to avoid allocating an intermediate bitmap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn query_cardinality(&self, expr: &types::SetExpr) -> Result<u64> {
+        use types::SetExpr;
+        // Optimization: leaf-pair And uses zero-alloc intersection_len
+        if let SetExpr::And(a, b) = expr {
+            if let (
+                SetExpr::Ref {
+                    event: ea,
+                    period: pa,
+                },
+                SetExpr::Ref {
+                    event: eb,
+                    period: pb,
+                },
+            ) = (a.as_ref(), b.as_ref())
+            {
+                return self.intersect_cardinality(ea, *pa, eb, *pb);
+            }
+        }
+        // Optimization: leaf-pair Or uses zero-alloc union_len
+        if let SetExpr::Or(a, b) = expr {
+            if let (
+                SetExpr::Ref {
+                    event: ea,
+                    period: pa,
+                },
+                SetExpr::Ref {
+                    event: eb,
+                    period: pb,
+                },
+            ) = (a.as_ref(), b.as_ref())
+            {
+                return self.union_cardinality(ea, *pa, eb, *pb);
+            }
+        }
+        // General case: materialize and count
+        let bm = self.query(expr)?;
+        Ok(bm.len())
     }
 
     /// Enumerates all periods from `start` to `end` (inclusive).
@@ -2883,5 +3152,386 @@ mod tests {
 
         let deleted = store.delete_entity("nobody").unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn intersect_cardinality_matches_materialized() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        for i in 0..10_000 {
+            a.insert(i);
+        }
+        for i in 5_000..15_000 {
+            b.insert(i);
+        }
+        store
+            .put_bitmap("a", Period::Day(2026, 4, 1), a.clone())
+            .unwrap();
+        store
+            .put_bitmap("b", Period::Day(2026, 4, 1), b.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let card = store
+            .intersect_cardinality("a", Period::Day(2026, 4, 1), "b", Period::Day(2026, 4, 1))
+            .unwrap();
+        let materialized = (&a & &b).len();
+        assert_eq!(card, materialized);
+        assert_eq!(card, 5000);
+    }
+
+    #[test]
+    fn union_cardinality_matches_materialized() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        for i in 0..100 {
+            a.insert(i);
+        }
+        for i in 50..200 {
+            b.insert(i);
+        }
+        store
+            .put_bitmap("x", Period::Day(2026, 4, 1), a.clone())
+            .unwrap();
+        store
+            .put_bitmap("y", Period::Day(2026, 4, 1), b.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let card = store
+            .union_cardinality("x", Period::Day(2026, 4, 1), "y", Period::Day(2026, 4, 1))
+            .unwrap();
+        assert_eq!(card, (&a | &b).len());
+        assert_eq!(card, 200);
+    }
+
+    #[test]
+    fn cardinality_range_returns_daily_counts() {
+        let (store, _dir) = test_store();
+
+        for d in 1..=5u8 {
+            let mut bm = RoaringBitmap::new();
+            for i in 0..(d as u32 * 100) {
+                bm.insert(i);
+            }
+            store.put_bitmap("ev", Period::Day(2026, 4, d), bm).unwrap();
+        }
+        store.flush().unwrap();
+
+        let result = store
+            .cardinality_range("ev", Period::Day(2026, 4, 1), Period::Day(2026, 4, 5))
+            .unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], (Period::Day(2026, 4, 1), 100));
+        assert_eq!(result[4], (Period::Day(2026, 4, 5), 500));
+    }
+
+    #[test]
+    fn cardinality_range_skips_empty_periods() {
+        let (store, _dir) = test_store();
+
+        store
+            .put_bitmap("ev", Period::Day(2026, 4, 1), bitmap_with(&[1, 2, 3]))
+            .unwrap();
+        store
+            .put_bitmap("ev", Period::Day(2026, 4, 3), bitmap_with(&[10, 20]))
+            .unwrap();
+        store.flush().unwrap();
+
+        let result = store
+            .cardinality_range("ev", Period::Day(2026, 4, 1), Period::Day(2026, 4, 5))
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, Period::Day(2026, 4, 1));
+        assert_eq!(result[1].0, Period::Day(2026, 4, 3));
+    }
+
+    #[cfg(feature = "uuid")]
+    mod uuid_api_tests {
+        use super::*;
+        use uuid::Uuid;
+
+        #[test]
+        fn put_get_uuids_roundtrip() {
+            let dir = TempDir::new().unwrap();
+            let store = InoxSet::builder()
+                .path(dir.path().join("data"))
+                .open()
+                .unwrap();
+
+            let ids: Vec<Uuid> = (0..100).map(|_| Uuid::new_v4()).collect();
+            store
+                .put_uuids("seg", Period::Day(2026, 4, 1), &ids)
+                .unwrap();
+            store.flush().unwrap();
+
+            let got = store.get_uuids("seg", Period::Day(2026, 4, 1)).unwrap();
+            assert_eq!(got.len(), 100);
+            for id in &ids {
+                assert!(got.contains(id));
+            }
+        }
+
+        #[test]
+        fn put_get_uuids_v7() {
+            let dir = TempDir::new().unwrap();
+            let store = InoxSet::builder()
+                .path(dir.path().join("data"))
+                .open()
+                .unwrap();
+
+            let ids: Vec<Uuid> = (0..10).map(|_| Uuid::now_v7()).collect();
+            store
+                .put_uuids("seg", Period::Day(2026, 4, 1), &ids)
+                .unwrap();
+            store.flush().unwrap();
+
+            let got = store.get_uuids("seg", Period::Day(2026, 4, 1)).unwrap();
+            assert_eq!(got.len(), 10);
+            for id in &ids {
+                assert!(got.contains(id));
+            }
+        }
+
+        #[test]
+        fn remove_uuids_works() {
+            let dir = TempDir::new().unwrap();
+            let store = InoxSet::builder()
+                .path(dir.path().join("data"))
+                .open()
+                .unwrap();
+
+            let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+            store
+                .put_uuids("seg", Period::Day(2026, 4, 1), &ids)
+                .unwrap();
+            store
+                .remove_uuids("seg", Period::Day(2026, 4, 1), &ids[..1])
+                .unwrap();
+
+            let got = store.get_uuids("seg", Period::Day(2026, 4, 1)).unwrap();
+            assert_eq!(got.len(), 2);
+            assert!(!got.contains(&ids[0]));
+        }
+
+        #[test]
+        fn delete_entity_uuid_works() {
+            let dir = TempDir::new().unwrap();
+            let store = InoxSet::builder()
+                .path(dir.path().join("data"))
+                .index_freshness(crate::types::IndexFreshness::OnFlush)
+                .open()
+                .unwrap();
+
+            let id = Uuid::new_v4();
+            store
+                .put_uuids("a", Period::Day(2026, 4, 1), &[id])
+                .unwrap();
+            store
+                .put_uuids("b", Period::Day(2026, 4, 1), &[id])
+                .unwrap();
+            store.flush().unwrap();
+
+            let deleted = store.delete_entity_uuid(&id).unwrap();
+            assert_eq!(deleted, 2);
+            assert!(store.find_memberships_uuid(&id).unwrap().is_empty());
+        }
+    }
+
+    // ─── Issue #8: SetExpr query engine ──────────────────────────────────────
+
+    #[test]
+    fn query_and_matches_manual_intersection() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        for i in 0..100 {
+            a.insert(i);
+        }
+        for i in 50..150 {
+            b.insert(i);
+        }
+        store
+            .put_bitmap("a", Period::Day(2026, 4, 1), a.clone())
+            .unwrap();
+        store
+            .put_bitmap("b", Period::Day(2026, 4, 1), b.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let expr = types::SetExpr::and(
+            types::SetExpr::Ref {
+                event: "a".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+            types::SetExpr::Ref {
+                event: "b".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+        );
+        let result = store.query(&expr).unwrap();
+        assert_eq!(result, &a & &b);
+        assert_eq!(result.len(), 50);
+    }
+
+    #[test]
+    fn query_or_matches_manual_union() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        for i in 0..100 {
+            a.insert(i);
+        }
+        for i in 50..150 {
+            b.insert(i);
+        }
+        store
+            .put_bitmap("a", Period::Day(2026, 4, 1), a.clone())
+            .unwrap();
+        store
+            .put_bitmap("b", Period::Day(2026, 4, 1), b.clone())
+            .unwrap();
+        store.flush().unwrap();
+
+        let expr = types::SetExpr::or(
+            types::SetExpr::Ref {
+                event: "a".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+            types::SetExpr::Ref {
+                event: "b".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+        );
+        let result = store.query(&expr).unwrap();
+        assert_eq!(result.len(), 150);
+    }
+
+    #[test]
+    fn query_diff_matches_manual_difference() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        for i in 0..100 {
+            a.insert(i);
+        }
+        for i in 50..150 {
+            b.insert(i);
+        }
+        store.put_bitmap("a", Period::Day(2026, 4, 1), a).unwrap();
+        store.put_bitmap("b", Period::Day(2026, 4, 1), b).unwrap();
+        store.flush().unwrap();
+
+        let expr = types::SetExpr::diff(
+            types::SetExpr::Ref {
+                event: "a".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+            types::SetExpr::Ref {
+                event: "b".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+        );
+        let result = store.query(&expr).unwrap();
+        assert_eq!(result.len(), 50); // 0..50
+    }
+
+    #[test]
+    fn query_nested_expression() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        let mut c = RoaringBitmap::new();
+        for i in 0..100 {
+            a.insert(i);
+        }
+        for i in 50..150 {
+            b.insert(i);
+        }
+        for i in 75..125 {
+            c.insert(i);
+        }
+        store.put_bitmap("a", Period::Day(2026, 4, 1), a).unwrap();
+        store.put_bitmap("b", Period::Day(2026, 4, 1), b).unwrap();
+        store.put_bitmap("c", Period::Day(2026, 4, 1), c).unwrap();
+        store.flush().unwrap();
+
+        // (A ∪ B) ∩ C → should be C (since C ⊂ A∪B)
+        let expr = types::SetExpr::and(
+            types::SetExpr::or(
+                types::SetExpr::Ref {
+                    event: "a".into(),
+                    period: Period::Day(2026, 4, 1),
+                },
+                types::SetExpr::Ref {
+                    event: "b".into(),
+                    period: Period::Day(2026, 4, 1),
+                },
+            ),
+            types::SetExpr::Ref {
+                event: "c".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+        );
+        let result = store.query(&expr).unwrap();
+        assert_eq!(result.len(), 50); // c has 75..125 = 50 items, all in a∪b
+    }
+
+    #[test]
+    fn query_cardinality_zero_alloc_for_leaf_and() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        let mut b = RoaringBitmap::new();
+        for i in 0..10_000 {
+            a.insert(i);
+        }
+        for i in 5_000..15_000 {
+            b.insert(i);
+        }
+        store.put_bitmap("a", Period::Day(2026, 4, 1), a).unwrap();
+        store.put_bitmap("b", Period::Day(2026, 4, 1), b).unwrap();
+        store.flush().unwrap();
+
+        let expr = types::SetExpr::and(
+            types::SetExpr::Ref {
+                event: "a".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+            types::SetExpr::Ref {
+                event: "b".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+        );
+        let card = store.query_cardinality(&expr).unwrap();
+        assert_eq!(card, 5000);
+    }
+
+    #[test]
+    fn query_and_short_circuits_on_empty() {
+        let (store, _dir) = test_store();
+        let mut a = RoaringBitmap::new();
+        for i in 0..100 {
+            a.insert(i);
+        }
+        store.put_bitmap("a", Period::Day(2026, 4, 1), a).unwrap();
+        store.flush().unwrap();
+
+        // "nonexistent" has no data → empty → short-circuit
+        let expr = types::SetExpr::and(
+            types::SetExpr::Ref {
+                event: "nonexistent".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+            types::SetExpr::Ref {
+                event: "a".into(),
+                period: Period::Day(2026, 4, 1),
+            },
+        );
+        let result = store.query(&expr).unwrap();
+        assert!(result.is_empty());
     }
 }

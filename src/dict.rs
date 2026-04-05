@@ -249,6 +249,104 @@ pub fn batch_reverse_lookup(
     Ok(result)
 }
 
+// ─── UUID helpers ─────────────────────────────────────────────────────────────
+
+#[cfg(feature = "uuid")]
+use uuid::Uuid;
+
+/// Assigns or retrieves a global `u32` for a UUID.
+///
+/// The UUID is stored using its canonical lowercase hyphenated string
+/// representation (36 bytes, e.g. `"550e8400-e29b-41d4-a716-446655440000"`).
+/// If the same UUID is also inserted via [`assign_or_get`] with a differently
+/// cased string, they will be treated as distinct entries. Always use this
+/// method for UUID-typed IDs.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+#[cfg(feature = "uuid")]
+pub fn assign_or_get_uuid(cat: &Catalog, id: &Uuid) -> crate::Result<u32> {
+    assign_or_get(cat, &id.to_string())
+}
+
+/// Read-only UUID lookup.
+///
+/// Returns the internal `u32` for `id`, or `None` if the UUID has not been
+/// registered.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+#[cfg(feature = "uuid")]
+pub fn lookup_uuid(cat: &Catalog, id: &Uuid) -> crate::Result<Option<u32>> {
+    lookup(cat, &id.to_string())
+}
+
+/// Reverse lookup: `u32` → [`Uuid`].
+///
+/// Returns `None` if the internal ID is not present in the reverse table or
+/// the stored string cannot be parsed as a UUID.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+#[cfg(feature = "uuid")]
+pub fn reverse_lookup_uuid(cat: &Catalog, internal_id: u32) -> crate::Result<Option<Uuid>> {
+    match reverse_lookup(cat, internal_id)? {
+        Some(s) => Ok(s.parse::<Uuid>().ok()),
+        None => Ok(None),
+    }
+}
+
+/// Deletes a UUID entity from the dictionary.
+///
+/// Returns the internal `u32` that was associated with `id`, or `None` if
+/// the UUID was not registered.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+#[cfg(feature = "uuid")]
+pub fn delete_uuid(cat: &Catalog, id: &Uuid) -> crate::Result<Option<u32>> {
+    delete(cat, &id.to_string())
+}
+
+/// Batch assign or retrieve `u32`s for UUIDs.
+///
+/// Returns a `Vec<u32>` in the **same order** as the input slice.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+#[cfg(feature = "uuid")]
+pub fn batch_assign_or_get_uuids(cat: &Catalog, ids: &[Uuid]) -> crate::Result<Vec<u32>> {
+    let strings: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+    let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+    batch_assign_or_get(cat, &refs)
+}
+
+/// Batch reverse lookup for UUIDs.
+///
+/// Returns a `Vec<Option<Uuid>>` in the **same order** as `internal_ids`.
+/// An entry is `None` when the internal ID is absent or the stored value
+/// cannot be parsed as a UUID.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+#[cfg(feature = "uuid")]
+pub fn batch_reverse_lookup_uuids(
+    cat: &Catalog,
+    internal_ids: &[u32],
+) -> crate::Result<Vec<Option<Uuid>>> {
+    let strings = batch_reverse_lookup(cat, internal_ids)?;
+    Ok(strings
+        .into_iter()
+        .map(|opt| opt.and_then(|s| s.parse::<Uuid>().ok()))
+        .collect())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -326,5 +424,72 @@ mod tests {
         assert_eq!(reverse_lookup(&cat, 0).unwrap(), None);
 
         assert_eq!(delete(&cat, "never-existed").unwrap(), None);
+    }
+}
+
+#[cfg(all(test, feature = "uuid"))]
+mod uuid_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_catalog() -> (Catalog, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cat = Catalog::open(dir.path().join("catalog.mdb")).unwrap();
+        (cat, dir)
+    }
+
+    #[test]
+    fn uuid_assign_and_lookup() {
+        let (cat, _dir) = test_catalog();
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let u32_id = assign_or_get_uuid(&cat, &id).unwrap();
+        let again = assign_or_get_uuid(&cat, &id).unwrap();
+        assert_eq!(u32_id, again);
+
+        let looked = lookup_uuid(&cat, &id).unwrap();
+        assert_eq!(looked, Some(u32_id));
+
+        let rev = reverse_lookup_uuid(&cat, u32_id).unwrap();
+        assert_eq!(rev, Some(id));
+    }
+
+    #[test]
+    fn uuid_batch_roundtrip() {
+        let (cat, _dir) = test_catalog();
+
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let u32s = batch_assign_or_get_uuids(&cat, &ids).unwrap();
+        assert_eq!(u32s.len(), 5);
+
+        let reversed = batch_reverse_lookup_uuids(&cat, &u32s).unwrap();
+        for (i, rev) in reversed.iter().enumerate() {
+            assert_eq!(rev.as_ref(), Some(&ids[i]));
+        }
+    }
+
+    #[test]
+    fn uuid_delete() {
+        let (cat, _dir) = test_catalog();
+        let id = Uuid::new_v4();
+
+        assign_or_get_uuid(&cat, &id).unwrap();
+        assert!(lookup_uuid(&cat, &id).unwrap().is_some());
+
+        delete_uuid(&cat, &id).unwrap();
+        assert!(lookup_uuid(&cat, &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn uuid_v7_works() {
+        let (cat, _dir) = test_catalog();
+        let id = Uuid::now_v7();
+
+        let u32_id = assign_or_get_uuid(&cat, &id).unwrap();
+        let again = assign_or_get_uuid(&cat, &id).unwrap();
+        assert_eq!(u32_id, again);
+
+        let rev = reverse_lookup_uuid(&cat, u32_id).unwrap();
+        assert_eq!(rev, Some(id));
     }
 }

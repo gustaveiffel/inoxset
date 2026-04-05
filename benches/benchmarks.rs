@@ -268,18 +268,17 @@ fn bench_dict_assign_throughput(c: &mut Criterion) {
 
     for n in [100, 1000, 10_000] {
         let dir = TempDir::new().unwrap();
-        let db = redb::Database::create(dir.path().join("dict.redb")).unwrap();
-        inoxset::dict::ensure_tables(&db).unwrap();
+        let cat = inoxset::catalog::Catalog::open(dir.path().join("dict.mdb")).unwrap();
 
         let ids: Vec<String> = (0..n).map(|i| format!("id-{i:08}")).collect();
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
 
         // First call seeds the dictionary.
-        inoxset::dict::batch_assign_or_get(&db, &id_refs).unwrap();
+        inoxset::dict::batch_assign_or_get(&cat, &id_refs).unwrap();
 
         group.bench_with_input(BenchmarkId::new("warm", n), &n, |b, _| {
             b.iter(|| {
-                black_box(inoxset::dict::batch_assign_or_get(&db, &id_refs).unwrap());
+                black_box(inoxset::dict::batch_assign_or_get(&cat, &id_refs).unwrap());
             })
         });
     }

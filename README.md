@@ -202,14 +202,14 @@ Measured with [Criterion](https://github.com/bheisler/criterion.rs) on Apple M-s
 
 | Operation | Scenario | Median |
 |-----------|----------|--------|
-| `put_bitmap` | 1K bits | **2.3 µs** |
-| `put_bitmap` | 1K bits + rollup auto | **6.2 µs** |
+| `put_bitmap` | 1K bits | **1.9 µs** |
+| `put_bitmap` | 1K bits + rollup auto | **5.7 µs** |
 | `get` | 1 part (mmap) | **14 µs** |
 | `get` | 5 parts merged | **65 µs** |
 | `get` | 20 parts merged | **259 µs** |
-| `get` | compacted, 100K bits (bitmap cache) | **426 ns** |
-| `put_ids` | 1K string IDs (dictionary) | **207 µs** |
-| `get_ids` | 1K string IDs (dictionary) | **103 µs** |
+| `get` | compacted, 100K bits (bitmap cache) | **420 ns** |
+| `put_ids` | 1K string IDs (dictionary) | **115 µs** |
+| `get_ids` | 1K string IDs (dictionary) | **147 µs** |
 | `find_memberships` | hit, 600 checks (inverted index) | **29 µs** |
 | `find_memberships` | miss (bloom rejects) | **30 ns** |
 | `flush` | 10 events x 100 periods | **342 ms** |
@@ -223,12 +223,12 @@ Compared on the same machine (Apple M-series, localhost). Redis 7.x on port 6379
 
 | Operation | inoxset | Redis | bitmapist-server |
 |-----------|---------|-------|------------------|
-| Write 1K IDs | **2.3 µs** | 1.19 ms | 2.60 ms |
-| Read 10K bitmap | **14 µs** | 86 µs | 18 µs |
-| Intersection 10K ∩ 10K | **784 ns** | 87 µs | 21 µs |
+| Write 1K IDs | **1.9 µs** | 1.19 ms | 2.60 ms |
+| Read 10K bitmap | **226 ns** | 86 µs | 18 µs |
+| Intersection 10K ∩ 10K | **802 ns** | 87 µs | 21 µs |
 | Reverse lookup (600 checks) | **29 µs** | 721 µs | 1.54 ms |
 
-inoxset is **500x faster on writes** (no network, no serialization pipeline), **110x faster on intersections** (bitmap cache, zero deserialization), and **25x faster on reverse lookups** (inverted index). The embedded advantage eliminates all network overhead.
+inoxset is **630x faster on writes** (no network, no serialization pipeline), **380x faster on reads** (bitmap cache, zero deserialization), and **25x faster on reverse lookups** (inverted index). The embedded advantage eliminates all network overhead.
 
 Run the comparison: `cargo bench --bench comparison` (requires Redis and bitmapist-server running locally).
 

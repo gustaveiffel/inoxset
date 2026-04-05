@@ -1,54 +1,33 @@
-//! Catalog module: redb-backed persistent metadata store for inoxset.
+//! Catalog module: LMDB-backed persistent metadata store for inoxset.
 //!
 //! The catalog stores event configurations, part metadata, period–part
 //! associations, delta-part lists, and period lifecycle state.  Every
 //! serialized value is prefixed with a version byte (`1`) so that future
 //! format changes can be detected at startup.
 //!
-//! # Tables
+//! # Databases (LMDB named databases)
 //!
-//! | Constant | Key | Value |
+//! | Field | Key | Value |
 //! |---|---|---|
-//! | [`EVENTS`] | event name | serialized [`EventConfig`] |
-//! | [`PARTS`] | `part_id` | serialized [`Part`] |
-//! | [`PERIOD_PARTS`] | `"event/gran/period_key"` | packed `Vec<u64>` |
-//! | [`PERIOD_DELTAS`] | `"event/gran/period_key"` | packed `Vec<u64>` |
-//! | [`PERIOD_STATE`] | `"event/gran/period_key"` | `u8` |
-//! | [`COMPACTION_LOG`] | timestamp | raw bytes |
-//! | [`NEXT_PART_ID`] | `()` | `u64` |
+//! | `events` | event name (`Str`) | serialized [`EventConfig`] (`Bytes`) |
+//! | `parts` | `part_id` (`U64`) | serialized [`Part`] (`Bytes`) |
+//! | `period_parts` | `"event/gran/period_key"` (`Str`) | packed `Vec<u64>` (`Bytes`) |
+//! | `period_deltas` | `"event/gran/period_key"` (`Str`) | packed `Vec<u64>` (`Bytes`) |
+//! | `period_state` | `"event/gran/period_key"` (`Str`) | `u8` as 1-byte slice (`Bytes`) |
+//! | `compaction_log` | timestamp (`U64`) | raw bytes (`Bytes`) |
+//! | `next_part_id` | fixed key `"_"` (`Str`) | next available `u64` (`U64`) |
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use heed::types::{Bytes, Str, U64};
+use heed::{Database, Env};
 
 use crate::error::InoxSetError;
 use crate::types::{EventConfig, Granularity, Part, PartKind, Period, PeriodState, Rollup};
 
-// ─── Table definitions ────────────────────────────────────────────────────────
-
-/// Event configuration table: event name → serialized [`EventConfig`].
-pub(crate) const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("events");
-
-/// Part metadata table: `part_id` → serialized [`Part`].
-pub(crate) const PARTS: TableDefinition<u64, &[u8]> = TableDefinition::new("parts");
-
-/// Period-to-part-list table: `"event/gran/period_key"` → packed `Vec<u64>`.
-pub(crate) const PERIOD_PARTS: TableDefinition<&str, &[u8]> = TableDefinition::new("period_parts");
-
-/// Period-to-delta-list table: `"event/gran/period_key"` → packed `Vec<u64>`.
-pub(crate) const PERIOD_DELTAS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("period_deltas");
-
-/// Period lifecycle state table: `"event/gran/period_key"` → `u8`.
-pub(crate) const PERIOD_STATE: TableDefinition<&str, u8> = TableDefinition::new("period_state");
-
-/// Compaction log table: Unix timestamp → raw bytes.
-pub(crate) const COMPACTION_LOG: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("compaction_log");
-
-/// Monotonically-increasing part-ID counter: `()` → next available `u64`.
-pub(crate) const NEXT_PART_ID: TableDefinition<(), u64> = TableDefinition::new("next_part_id");
+/// Fixed key used for singleton entries (next_part_id, next_dict_id).
+const SINGLETON_KEY: &str = "_";
 
 // ─── Serialization helpers ────────────────────────────────────────────────────
 
@@ -515,47 +494,118 @@ pub(crate) fn deserialize_part(ctx: &str, data: &[u8]) -> crate::Result<Part> {
 
 // ─── Catalog ─────────────────────────────────────────────────────────────────
 
-/// Persistent metadata catalog backed by a [`redb`] embedded database.
+/// Returns the platform-aware default LMDB map size.
+///
+/// macOS (APFS) does not support sparse files, so the mmap pre-allocates the
+/// full map_size on disk. We use a smaller default (64 MiB) to avoid wasting
+/// disk on dev machines. Linux supports sparse files, so 256 MiB is fine.
+fn default_map_size() -> usize {
+    if cfg!(target_os = "macos") {
+        64 * 1024 * 1024 // 64 MiB
+    } else {
+        256 * 1024 * 1024 // 256 MiB
+    }
+}
+
+/// Persistent metadata catalog backed by LMDB via the [`heed`] crate.
 ///
 /// One `Catalog` instance is intended to live for the lifetime of an open
 /// store.  All operations open a fresh transaction, perform their work, and
 /// commit — there is no long-lived transaction state.
 ///
+/// Each named LMDB database handle is opened once at construction time and
+/// stored on the struct; transactions simply borrow them.
+///
 /// # Thread safety
 ///
-/// `redb::Database` is `Send + Sync`; the `Catalog` inherits those bounds and
+/// `heed::Env` is `Send + Sync`; the `Catalog` inherits those bounds and
 /// can be shared across threads (e.g. via `Arc<Catalog>`).
 pub struct Catalog {
-    db: Database,
+    env: Env,
+    pub(crate) events: Database<Str, Bytes>,
+    pub(crate) parts: Database<U64<heed::byteorder::NativeEndian>, Bytes>,
+    pub(crate) period_parts: Database<Str, Bytes>,
+    pub(crate) period_deltas: Database<Str, Bytes>,
+    pub(crate) period_state: Database<Str, Bytes>,
+    pub(crate) compaction_log: Database<U64<heed::byteorder::NativeEndian>, Bytes>,
+    pub(crate) next_part_id: Database<Str, U64<heed::byteorder::NativeEndian>>,
+    // Dictionary databases (shared environment).
+    pub(crate) dict_fwd: Database<Str, U64<heed::byteorder::NativeEndian>>,
+    pub(crate) dict_rev: Database<U64<heed::byteorder::NativeEndian>, Str>,
+    pub(crate) dict_next_id: Database<Str, U64<heed::byteorder::NativeEndian>>,
 }
 
 impl Catalog {
-    /// Opens (or creates) the catalog database at `path`.
+    /// Opens (or creates) the catalog LMDB environment at `path`.
     ///
-    /// All required tables are created on first open.
+    /// All named databases are created on first open.  The `map_size` parameter
+    /// controls the maximum size of the memory-mapped region (default 256 MiB).
+    ///
+    /// # Safety
+    ///
+    /// `heed::Env::open` is `unsafe` because the underlying LMDB memory-maps
+    /// the data file.  The caller must ensure that no external process modifies
+    /// the data file while this environment is open — the same constraint that
+    /// applies to our bitmap mmap usage in `part_store`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database file cannot be opened or any table
-    /// cannot be created.
+    /// Returns an error if the environment cannot be opened or any named
+    /// database cannot be created.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let db = Database::create(path.as_ref()).map_err(redb::Error::from)?;
-        // Ensure all tables exist.
-        let write_txn = db.begin_write()?;
-        {
-            write_txn.open_table(EVENTS)?;
-            write_txn.open_table(PARTS)?;
-            write_txn.open_table(PERIOD_PARTS)?;
-            write_txn.open_table(PERIOD_DELTAS)?;
-            write_txn.open_table(PERIOD_STATE)?;
-            write_txn.open_table(COMPACTION_LOG)?;
-            write_txn.open_table(NEXT_PART_ID)?;
-            write_txn.open_table(crate::dict::DICT_FWD)?;
-            write_txn.open_table(crate::dict::DICT_REV)?;
-            write_txn.open_table(crate::dict::NEXT_DICT_ID)?;
-        }
-        write_txn.commit()?;
-        Ok(Self { db })
+        Self::open_with_map_size(path, default_map_size())
+    }
+
+    /// Opens the catalog with an explicit LMDB map size.
+    ///
+    /// See [`open`](Self::open) for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the environment cannot be opened or any named
+    /// database cannot be created.
+    pub fn open_with_map_size(path: impl AsRef<Path>, map_size: usize) -> crate::Result<Self> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path).map_err(|e| InoxSetError::BitmapIo {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        // Safety: we guarantee the LMDB data file is not modified externally
+        // while this environment is open (same constraint as part_store mmap).
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .map_size(map_size)
+                .max_dbs(12)
+                .open(path)?
+        };
+
+        let mut wtxn = env.write_txn()?;
+        let events = env.create_database(&mut wtxn, Some("events"))?;
+        let parts = env.create_database(&mut wtxn, Some("parts"))?;
+        let period_parts = env.create_database(&mut wtxn, Some("period_parts"))?;
+        let period_deltas = env.create_database(&mut wtxn, Some("period_deltas"))?;
+        let period_state = env.create_database(&mut wtxn, Some("period_state"))?;
+        let compaction_log = env.create_database(&mut wtxn, Some("compaction_log"))?;
+        let next_part_id = env.create_database(&mut wtxn, Some("next_part_id"))?;
+        let dict_fwd = env.create_database(&mut wtxn, Some("dict_fwd_v2"))?;
+        let dict_rev = env.create_database(&mut wtxn, Some("dict_rev_v2"))?;
+        let dict_next_id = env.create_database(&mut wtxn, Some("next_dict_id_v2"))?;
+        wtxn.commit()?;
+
+        Ok(Self {
+            env,
+            events,
+            parts,
+            period_parts,
+            period_deltas,
+            period_state,
+            compaction_log,
+            next_part_id,
+            dict_fwd,
+            dict_rev,
+            dict_next_id,
+        })
     }
 
     // ─── Events ───────────────────────────────────────────────────────────────
@@ -566,14 +616,11 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn register_event(&self, config: &EventConfig) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(EVENTS)?;
-            let bytes = serialize_event_config(config);
-            table.insert(config.name.as_str(), bytes.as_slice())?;
-        }
+        let mut txn = self.env.write_txn()?;
+        let bytes = serialize_event_config(config);
+        self.events.put(&mut txn, config.name.as_str(), &bytes)?;
         txn.commit()?;
         Ok(())
     }
@@ -582,32 +629,29 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn get_event(&self, name: &str) -> crate::Result<Option<EventConfig>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(EVENTS)?;
-        let result = match table.get(name)? {
+        let txn = self.env.read_txn()?;
+        match self.events.get(&txn, name)? {
             None => Ok(None),
-            Some(guard) => {
-                let ec = deserialize_event_config(name, guard.value())?;
+            Some(data) => {
+                let ec = deserialize_event_config(name, data)?;
                 Ok(Some(ec))
             }
-        };
-        result
+        }
     }
 
     /// Returns all registered [`EventConfig`]s.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn list_events(&self) -> crate::Result<Vec<EventConfig>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(EVENTS)?;
+        let txn = self.env.read_txn()?;
         let mut out = Vec::new();
-        for item in table.iter()? {
-            let (key, value) = item?;
-            let ec = deserialize_event_config(key.value(), value.value())?;
+        for result in self.events.iter(&txn)? {
+            let (key, value) = result?;
+            let ec = deserialize_event_config(key, value)?;
             out.push(ec);
         }
         Ok(out)
@@ -622,7 +666,7 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn delete_event(&self, name: &str) -> crate::Result<Vec<u64>> {
         let parts = self.delete_event_returning_parts(name)?;
         Ok(parts.into_iter().map(|p| p.part_id).collect())
@@ -637,73 +681,75 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn delete_event_returning_parts(&self, name: &str) -> crate::Result<Vec<Part>> {
-        let txn = self.db.begin_write()?;
+        let mut txn = self.env.write_txn()?;
         let mut parts: Vec<Part> = Vec::new();
-        {
-            let mut events_table = txn.open_table(EVENTS)?;
-            events_table.remove(name)?;
 
-            let mut pp_table = txn.open_table(PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(PERIOD_STATE)?;
-            let mut parts_table = txn.open_table(PARTS)?;
+        self.events.delete(&mut txn, name)?;
 
-            let prefix = format!("{}/", name);
+        let prefix = format!("{}/", name);
 
-            // Collect part IDs from period_parts, propagating I/O errors.
-            let mut pp_keys: Vec<String> = Vec::new();
-            for item in pp_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value().to_string();
-                if key.starts_with(&prefix) {
-                    pp_keys.push(key);
+        // Collect part IDs from period_parts, propagating I/O errors.
+        let pp_keys: Vec<String> = {
+            let mut keys = Vec::new();
+            for result in self.period_parts.iter(&txn)? {
+                let (k, _) = result?;
+                if k.starts_with(&prefix) {
+                    keys.push(k.to_string());
                 }
             }
-            let mut part_ids: Vec<u64> = Vec::new();
-            for key in &pp_keys {
-                if let Some(guard) = pp_table.remove(key.as_str())? {
-                    let ids = deserialize_u64_vec(key, guard.value())?;
-                    part_ids.extend(ids);
-                }
+            keys
+        };
+        let mut part_ids: Vec<u64> = Vec::new();
+        for key in &pp_keys {
+            if let Some(data) = self.period_parts.get(&txn, key.as_str())? {
+                let ids = deserialize_u64_vec(key, data)?;
+                part_ids.extend(ids);
             }
-
-            // Delete period_deltas entries, propagating I/O errors.
-            let mut pd_keys: Vec<String> = Vec::new();
-            for item in pd_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value().to_string();
-                if key.starts_with(&prefix) {
-                    pd_keys.push(key);
-                }
-            }
-            for key in &pd_keys {
-                pd_table.remove(key.as_str())?;
-            }
-
-            // Delete period_state entries, propagating I/O errors.
-            let mut ps_keys: Vec<String> = Vec::new();
-            for item in ps_table.iter()? {
-                let (k, _) = item?;
-                let key = k.value().to_string();
-                if key.starts_with(&prefix) {
-                    ps_keys.push(key);
-                }
-            }
-            for key in &ps_keys {
-                ps_table.remove(key.as_str())?;
-            }
-
-            // Read then remove each Part entry so we can return the structs.
-            for pid in part_ids {
-                let ctx = format!("part_id={pid}");
-                if let Some(guard) = parts_table.remove(pid)? {
-                    let part = deserialize_part(&ctx, guard.value())?;
-                    parts.push(part);
-                }
-            }
+            self.period_parts.delete(&mut txn, key.as_str())?;
         }
+
+        // Delete period_deltas entries, propagating I/O errors.
+        let pd_keys: Vec<String> = {
+            let mut keys = Vec::new();
+            for result in self.period_deltas.iter(&txn)? {
+                let (k, _) = result?;
+                if k.starts_with(&prefix) {
+                    keys.push(k.to_string());
+                }
+            }
+            keys
+        };
+        for key in &pd_keys {
+            self.period_deltas.delete(&mut txn, key.as_str())?;
+        }
+
+        // Delete period_state entries, propagating I/O errors.
+        let ps_keys: Vec<String> = {
+            let mut keys = Vec::new();
+            for result in self.period_state.iter(&txn)? {
+                let (k, _) = result?;
+                if k.starts_with(&prefix) {
+                    keys.push(k.to_string());
+                }
+            }
+            keys
+        };
+        for key in &ps_keys {
+            self.period_state.delete(&mut txn, key.as_str())?;
+        }
+
+        // Read then remove each Part entry so we can return the structs.
+        for pid in part_ids {
+            let ctx = format!("part_id={pid}");
+            if let Some(data) = self.parts.get(&txn, &pid)? {
+                let part = deserialize_part(&ctx, data)?;
+                parts.push(part);
+            }
+            self.parts.delete(&mut txn, &pid)?;
+        }
+
         txn.commit()?;
         Ok(parts)
     }
@@ -718,41 +764,39 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn delete_period_returning_parts(&self, cat_key: &str) -> crate::Result<Vec<Part>> {
-        let txn = self.db.begin_write()?;
+        let mut txn = self.env.write_txn()?;
         let mut parts: Vec<Part> = Vec::new();
-        {
-            let mut pp_table = txn.open_table(PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(PERIOD_STATE)?;
-            let mut parts_table = txn.open_table(PARTS)?;
 
-            // Collect data part IDs.
-            let mut part_ids: Vec<u64> = Vec::new();
-            if let Some(guard) = pp_table.remove(cat_key)? {
-                let ids = deserialize_u64_vec(cat_key, guard.value())?;
-                part_ids.extend(ids);
-            }
-
-            // Collect delta part IDs.
-            if let Some(guard) = pd_table.remove(cat_key)? {
-                let ids = deserialize_u64_vec(cat_key, guard.value())?;
-                part_ids.extend(ids);
-            }
-
-            // Remove period state.
-            ps_table.remove(cat_key)?;
-
-            // Read then remove each Part entry.
-            for pid in part_ids {
-                let ctx = format!("part_id={pid}");
-                if let Some(guard) = parts_table.remove(pid)? {
-                    let part = deserialize_part(&ctx, guard.value())?;
-                    parts.push(part);
-                }
-            }
+        // Collect data part IDs.
+        let mut part_ids: Vec<u64> = Vec::new();
+        if let Some(data) = self.period_parts.get(&txn, cat_key)? {
+            let ids = deserialize_u64_vec(cat_key, data)?;
+            part_ids.extend(ids);
         }
+        self.period_parts.delete(&mut txn, cat_key)?;
+
+        // Collect delta part IDs.
+        if let Some(data) = self.period_deltas.get(&txn, cat_key)? {
+            let ids = deserialize_u64_vec(cat_key, data)?;
+            part_ids.extend(ids);
+        }
+        self.period_deltas.delete(&mut txn, cat_key)?;
+
+        // Remove period state.
+        self.period_state.delete(&mut txn, cat_key)?;
+
+        // Read then remove each Part entry.
+        for pid in part_ids {
+            let ctx = format!("part_id={pid}");
+            if let Some(data) = self.parts.get(&txn, &pid)? {
+                let part = deserialize_part(&ctx, data)?;
+                parts.push(part);
+            }
+            self.parts.delete(&mut txn, &pid)?;
+        }
+
         txn.commit()?;
         Ok(parts)
     }
@@ -764,19 +808,16 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn next_part_id(&self) -> crate::Result<u64> {
-        let txn = self.db.begin_write()?;
-        let id;
-        {
-            let mut table = txn.open_table(NEXT_PART_ID)?;
-            id = Self::txn_alloc_part_ids(&mut table, 1)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| InoxSetError::CatalogCorrupted {
-                    context: "txn_alloc_part_ids(1) returned empty vec".to_string(),
-                })?;
-        }
+        let mut txn = self.env.write_txn()?;
+        let ids = Self::txn_alloc_part_ids(&self.next_part_id, &mut txn, 1)?;
+        let id = ids
+            .into_iter()
+            .next()
+            .ok_or_else(|| InoxSetError::CatalogCorrupted {
+                context: "txn_alloc_part_ids(1) returned empty vec".to_string(),
+            })?;
         txn.commit()?;
         Ok(id)
     }
@@ -787,13 +828,10 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn register_part(&self, part: &Part) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PARTS)?;
-            Self::txn_register_part(&mut table, part)?;
-        }
+        let mut txn = self.env.write_txn()?;
+        Self::txn_register_part(&self.parts, &mut txn, part)?;
         txn.commit()?;
         Ok(())
     }
@@ -802,25 +840,23 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn get_part(&self, part_id: u64) -> crate::Result<Option<Part>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PARTS)?;
-        Self::txn_get_part(&table, part_id)
+        let txn = self.env.read_txn()?;
+        Self::txn_get_part(&self.parts, &txn, part_id)
     }
 
     /// Returns all `part_id`s currently tracked in the catalog.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn all_part_ids(&self) -> crate::Result<Vec<u64>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PARTS)?;
+        let txn = self.env.read_txn()?;
         let mut ids = Vec::new();
-        for item in table.iter()? {
-            let (key, _) = item?;
-            ids.push(key.value());
+        for result in self.parts.iter(&txn)? {
+            let (key, _) = result?;
+            ids.push(key);
         }
         Ok(ids)
     }
@@ -833,24 +869,20 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn get_period_parts(&self, key: &str) -> crate::Result<Vec<u64>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PERIOD_PARTS)?;
-        Self::txn_get_period_parts(&table, key)
+        let txn = self.env.read_txn()?;
+        Self::txn_get_period_parts(&self.period_parts, &txn, key)
     }
 
     /// Appends `ids` to the period-parts list for `key`.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn append_period_parts(&self, key: &str, ids: &[u64]) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PERIOD_PARTS)?;
-            Self::txn_append_period_parts(&mut table, key, ids)?;
-        }
+        let mut txn = self.env.write_txn()?;
+        Self::txn_append_period_parts(&self.period_parts, &mut txn, key, ids)?;
         txn.commit()?;
         Ok(())
     }
@@ -859,13 +891,10 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn set_period_parts(&self, key: &str, ids: &[u64]) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PERIOD_PARTS)?;
-            Self::txn_set_period_parts(&mut table, key, ids)?;
-        }
+        let mut txn = self.env.write_txn()?;
+        Self::txn_set_period_parts(&self.period_parts, &mut txn, key, ids)?;
         txn.commit()?;
         Ok(())
     }
@@ -878,24 +907,20 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn get_period_deltas(&self, key: &str) -> crate::Result<Vec<u64>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PERIOD_DELTAS)?;
-        Self::txn_get_period_deltas(&table, key)
+        let txn = self.env.read_txn()?;
+        Self::txn_get_period_deltas(&self.period_deltas, &txn, key)
     }
 
     /// Appends `ids` to the period-deltas list for `key`.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn append_period_deltas(&self, key: &str, ids: &[u64]) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PERIOD_DELTAS)?;
-            Self::txn_append_period_deltas(&mut table, key, ids)?;
-        }
+        let mut txn = self.env.write_txn()?;
+        Self::txn_append_period_deltas(&self.period_deltas, &mut txn, key, ids)?;
         txn.commit()?;
         Ok(())
     }
@@ -904,13 +929,10 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn clear_period_deltas(&self, key: &str) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PERIOD_DELTAS)?;
-            Self::txn_clear_period_deltas(&mut table, key)?;
-        }
+        let mut txn = self.env.write_txn()?;
+        Self::txn_clear_period_deltas(&self.period_deltas, &mut txn, key)?;
         txn.commit()?;
         Ok(())
     }
@@ -921,37 +943,33 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn get_period_state(&self, key: &str) -> crate::Result<Option<PeriodState>> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PERIOD_STATE)?;
-        Self::txn_get_period_state(&table, key)
+        let txn = self.env.read_txn()?;
+        Self::txn_get_period_state(&self.period_state, &txn, key)
     }
 
     /// Sets the [`PeriodState`] for `key`.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn set_period_state(&self, key: &str, state: PeriodState) -> crate::Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(PERIOD_STATE)?;
-            Self::txn_set_period_state(&mut table, key, state)?;
-        }
+        let mut txn = self.env.write_txn()?;
+        Self::txn_set_period_state(&self.period_state, &mut txn, key, state)?;
         txn.commit()?;
         Ok(())
     }
 
-    // ─── Database access ──────────────────────────────────────────────────────
+    // ─── Environment access ──────────────────────────────────────────────────
 
-    /// Returns a reference to the underlying [`Database`].
+    /// Returns a reference to the underlying [`Env`].
     ///
     /// This is provided so that callers (e.g. the flush or compaction layer)
     /// can open their own transactions and call the `txn_*` static helpers
     /// without going through individual `Catalog` methods.
-    pub fn db(&self) -> &Database {
-        &self.db
+    pub fn env(&self) -> &Env {
+        &self.env
     }
 
     // ─── Transaction helpers ──────────────────────────────────────────────────
@@ -963,122 +981,135 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn txn_alloc_part_ids(
-        table: &mut redb::Table<(), u64>,
+        db: &Database<Str, U64<heed::byteorder::NativeEndian>>,
+        txn: &mut heed::RwTxn,
         count: u64,
     ) -> crate::Result<Vec<u64>> {
-        let start = match table.get(())? {
-            Some(guard) => guard.value(),
-            None => 1u64,
-        };
+        let start = db.get(txn, SINGLETON_KEY)?.unwrap_or(1u64);
         let end = start
             .checked_add(count)
             .ok_or_else(|| InoxSetError::CatalogCorrupted {
                 context: format!("part ID counter overflow: start={start}, count={count}"),
             })?;
-        table.insert((), end)?;
+        db.put(txn, SINGLETON_KEY, &end)?;
         Ok((start..end).collect())
     }
 
-    /// Inserts a [`Part`] record into an open `parts` write table.
+    /// Inserts a [`Part`] record using the given database and write transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn txn_register_part(
-        table: &mut redb::Table<u64, &[u8]>,
+        db: &Database<U64<heed::byteorder::NativeEndian>, Bytes>,
+        txn: &mut heed::RwTxn,
         part: &Part,
     ) -> crate::Result<()> {
         let bytes = serialize_part(part)?;
-        table.insert(part.part_id, bytes.as_slice())?;
+        db.put(txn, &part.part_id, &bytes)?;
         Ok(())
     }
 
-    /// Appends `ids` to the period-parts list in an open write table.
+    /// Appends `ids` to the period-parts list using the given database and
+    /// write transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn txn_append_period_parts(
-        table: &mut redb::Table<&str, &[u8]>,
+        db: &Database<Str, Bytes>,
+        txn: &mut heed::RwTxn,
         key: &str,
         ids: &[u64],
     ) -> crate::Result<()> {
-        let mut existing = match table.get(key)? {
-            Some(guard) => deserialize_u64_vec(key, guard.value())?,
+        let mut existing = match db.get(txn, key)? {
+            Some(data) => deserialize_u64_vec(key, data)?,
             None => Vec::new(),
         };
         existing.extend_from_slice(ids);
         let bytes = serialize_u64_vec(&existing);
-        table.insert(key, bytes.as_slice())?;
+        db.put(txn, key, &bytes)?;
         Ok(())
     }
 
-    /// Replaces the period-parts list in an open write table.
+    /// Replaces the period-parts list using the given database and write
+    /// transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn txn_set_period_parts(
-        table: &mut redb::Table<&str, &[u8]>,
+        db: &Database<Str, Bytes>,
+        txn: &mut heed::RwTxn,
         key: &str,
         ids: &[u64],
     ) -> crate::Result<()> {
         let bytes = serialize_u64_vec(ids);
-        table.insert(key, bytes.as_slice())?;
+        db.put(txn, key, &bytes)?;
         Ok(())
     }
 
-    /// Appends `ids` to the period-deltas list in an open write table.
+    /// Appends `ids` to the period-deltas list using the given database and
+    /// write transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn txn_append_period_deltas(
-        table: &mut redb::Table<&str, &[u8]>,
+        db: &Database<Str, Bytes>,
+        txn: &mut heed::RwTxn,
         key: &str,
         ids: &[u64],
     ) -> crate::Result<()> {
-        let mut existing = match table.get(key)? {
-            Some(guard) => deserialize_u64_vec(key, guard.value())?,
+        let mut existing = match db.get(txn, key)? {
+            Some(data) => deserialize_u64_vec(key, data)?,
             None => Vec::new(),
         };
         existing.extend_from_slice(ids);
         let bytes = serialize_u64_vec(&existing);
-        table.insert(key, bytes.as_slice())?;
+        db.put(txn, key, &bytes)?;
         Ok(())
     }
 
-    /// Removes the period-deltas entry for `key` in an open write table.
+    /// Removes the period-deltas entry for `key` using the given database and
+    /// write transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn txn_clear_period_deltas(
-        table: &mut redb::Table<&str, &[u8]>,
+        db: &Database<Str, Bytes>,
+        txn: &mut heed::RwTxn,
         key: &str,
     ) -> crate::Result<()> {
-        table.remove(key)?;
+        db.delete(txn, key)?;
         Ok(())
     }
 
-    /// Reads the [`PeriodState`] for `key` from any readable period-state
-    /// table (both write and read-only tables are accepted).
+    /// Reads the [`PeriodState`] for `key` from a period-state database using
+    /// any readable transaction.
     ///
     /// Returns `None` when `key` is absent.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or an unknown state byte.
-    pub fn txn_get_period_state<T: ReadableTable<&'static str, u8>>(
-        table: &T,
+    /// Returns an error on LMDB I/O failure or an unknown state byte.
+    pub fn txn_get_period_state(
+        db: &Database<Str, Bytes>,
+        txn: &heed::RoTxn,
         key: &str,
     ) -> crate::Result<Option<PeriodState>> {
-        match table.get(key)? {
+        match db.get(txn, key)? {
             None => Ok(None),
-            Some(guard) => {
-                let byte = guard.value();
+            Some(data) => {
+                if data.is_empty() {
+                    return Err(InoxSetError::CatalogCorrupted {
+                        context: format!("period_state '{}': empty value", key),
+                    });
+                }
+                let byte = data[0];
                 PeriodState::from_u8(byte)
                     .map(Some)
                     .ok_or_else(|| InoxSetError::CatalogCorrupted {
@@ -1088,78 +1119,85 @@ impl Catalog {
         }
     }
 
-    /// Sets the [`PeriodState`] for `key` in an open write table.
+    /// Sets the [`PeriodState`] for `key` using the given database and write
+    /// transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn txn_set_period_state(
-        table: &mut redb::Table<&str, u8>,
+        db: &Database<Str, Bytes>,
+        txn: &mut heed::RwTxn,
         key: &str,
         state: PeriodState,
     ) -> crate::Result<()> {
-        table.insert(key, state.as_u8())?;
+        db.put(txn, key, &[state.as_u8()])?;
         Ok(())
     }
 
-    /// Reads the `part_id` list for `key` from an open **read-only** table.
+    /// Reads the `part_id` list for `key` from a period-parts database using
+    /// any readable transaction.
     ///
     /// Returns an empty `Vec` when `key` is absent.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn txn_get_period_parts(
-        table: &redb::ReadOnlyTable<&str, &[u8]>,
+        db: &Database<Str, Bytes>,
+        txn: &heed::RoTxn,
         key: &str,
     ) -> crate::Result<Vec<u64>> {
-        match table.get(key)? {
+        match db.get(txn, key)? {
             None => Ok(Vec::new()),
-            Some(guard) => deserialize_u64_vec(key, guard.value()),
+            Some(data) => deserialize_u64_vec(key, data),
         }
     }
 
-    /// Reads the delta `part_id` list for `key` from an open **read-only**
-    /// table.
+    /// Reads the delta `part_id` list for `key` from a period-deltas database
+    /// using any readable transaction.
     ///
     /// Returns an empty `Vec` when `key` is absent.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn txn_get_period_deltas(
-        table: &redb::ReadOnlyTable<&str, &[u8]>,
+        db: &Database<Str, Bytes>,
+        txn: &heed::RoTxn,
         key: &str,
     ) -> crate::Result<Vec<u64>> {
-        match table.get(key)? {
+        match db.get(txn, key)? {
             None => Ok(Vec::new()),
-            Some(guard) => deserialize_u64_vec(key, guard.value()),
+            Some(data) => deserialize_u64_vec(key, data),
         }
     }
 
-    /// Reads a [`Part`] by `pid` from an open **read-only** parts table.
+    /// Reads a [`Part`] by `pid` from a parts database using any readable
+    /// transaction.
     ///
     /// Returns `None` when `pid` is not present.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure or data corruption.
+    /// Returns an error on LMDB I/O failure or data corruption.
     pub fn txn_get_part(
-        table: &redb::ReadOnlyTable<u64, &[u8]>,
+        db: &Database<U64<heed::byteorder::NativeEndian>, Bytes>,
+        txn: &heed::RoTxn,
         pid: u64,
     ) -> crate::Result<Option<Part>> {
-        match table.get(pid)? {
+        match db.get(txn, &pid)? {
             None => Ok(None),
-            Some(guard) => {
+            Some(data) => {
                 let ctx = format!("part_id={pid}");
-                deserialize_part(&ctx, guard.value()).map(Some)
+                deserialize_part(&ctx, data).map(Some)
             }
         }
     }
 
     // ─── Compaction log ───────────────────────────────────────────────────────
 
-    /// Appends a compaction record to the [`COMPACTION_LOG`] table.
+    /// Appends a compaction record to the compaction log database.
     ///
     /// The key is the Unix timestamp supplied by the caller. The value is a
     /// version-1 binary encoding:
@@ -1175,7 +1213,7 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn write_compaction_log(
         &self,
         timestamp: u64,
@@ -1192,11 +1230,8 @@ impl Catalog {
         buf.extend_from_slice(&deltas_applied.to_le_bytes());
         buf.extend_from_slice(&bytes_reclaimed.to_le_bytes());
 
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(COMPACTION_LOG)?;
-            table.insert(timestamp, buf.as_slice())?;
-        }
+        let mut txn = self.env.write_txn()?;
+        self.compaction_log.put(&mut txn, &timestamp, &buf)?;
         txn.commit()?;
         Ok(())
     }
@@ -1205,38 +1240,30 @@ impl Catalog {
 
     /// Returns a deduplicated list of all period keys (`"event/gran/period"`)
     /// that reference the given event, drawn from both `period_parts` and
-    /// `period_deltas` tables.
+    /// `period_deltas` databases.
     ///
     /// Uses a [`HashSet`] internally to guarantee O(n) deduplication.
     ///
     /// # Errors
     ///
-    /// Returns an error on redb I/O failure.
+    /// Returns an error on LMDB I/O failure.
     pub fn period_keys_for_event(&self, event: &str) -> crate::Result<Vec<String>> {
         let prefix = format!("{}/", event);
-        let txn = self.db.begin_read()?;
+        let txn = self.env.read_txn()?;
 
         let mut seen: HashSet<String> = HashSet::new();
 
-        {
-            let pp_table = txn.open_table(PERIOD_PARTS)?;
-            for item in pp_table.iter()? {
-                let (key, _) = item?;
-                let k = key.value();
-                if k.starts_with(&prefix) {
-                    seen.insert(k.to_string());
-                }
+        for result in self.period_parts.iter(&txn)? {
+            let (k, _) = result?;
+            if k.starts_with(&prefix) {
+                seen.insert(k.to_string());
             }
         }
 
-        {
-            let pd_table = txn.open_table(PERIOD_DELTAS)?;
-            for item in pd_table.iter()? {
-                let (key, _) = item?;
-                let k = key.value();
-                if k.starts_with(&prefix) {
-                    seen.insert(k.to_string());
-                }
+        for result in self.period_deltas.iter(&txn)? {
+            let (k, _) = result?;
+            if k.starts_with(&prefix) {
+                seen.insert(k.to_string());
             }
         }
 
@@ -1254,7 +1281,7 @@ mod tests {
 
     fn test_catalog() -> (Catalog, TempDir) {
         let dir = TempDir::new().unwrap();
-        let cat = Catalog::open(dir.path().join("catalog.redb")).unwrap();
+        let cat = Catalog::open(dir.path().join("catalog.mdb")).unwrap();
         (cat, dir)
     }
 
@@ -1334,7 +1361,6 @@ mod tests {
             .unwrap();
         cat.append_period_parts("active/hour/2026-03-11T14", &[1])
             .unwrap();
-        // Register the Part so delete_event_returning_parts can resolve it.
         let part = Part {
             part_id: 1,
             kind: PartKind::Data,
@@ -1355,24 +1381,23 @@ mod tests {
 
     #[test]
     fn version_byte_corruption_detected() {
-        // Verify that deserialize_event_config rejects data with wrong version
-        let result = deserialize_event_config("test", &[99, 1, 0]); // version 99
+        let result = deserialize_event_config("test", &[99, 1, 0]);
         assert!(result.is_err());
     }
 
     #[test]
     fn short_data_corruption_detected() {
-        // Verify that deserialize_event_config rejects too-short data
-        let result = deserialize_event_config("test", &[1]); // only 1 byte
+        let result = deserialize_event_config("test", &[1]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn catalog_creates_dict_tables() {
+    fn catalog_creates_dict_databases() {
         let (cat, _dir) = test_catalog();
-        let rtxn = cat.db().begin_read().unwrap();
-        let _fwd = rtxn.open_table(crate::dict::DICT_FWD).unwrap();
-        let _rev = rtxn.open_table(crate::dict::DICT_REV).unwrap();
-        let _next = rtxn.open_table(crate::dict::NEXT_DICT_ID).unwrap();
+        // Verify dict databases are accessible via a read transaction.
+        let rtxn = cat.env().read_txn().unwrap();
+        assert!(cat.dict_fwd.get(&rtxn, "nonexistent").unwrap().is_none());
+        assert!(cat.dict_rev.get(&rtxn, &999u64).unwrap().is_none());
+        assert!(cat.dict_next_id.get(&rtxn, "_").unwrap().is_none());
     }
 }

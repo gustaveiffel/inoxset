@@ -6,64 +6,36 @@
 //! the same external ID always resolves to the same internal integer regardless
 //! of which event it is used with.
 //!
-//! Counters and mappings are stored in a `redb::Database` that the caller
-//! supplies directly — this module does **not** go through the
-//! [`crate::catalog::Catalog`] struct.
+//! Counters and mappings are stored in the LMDB environment shared with the
+//! [`crate::catalog::Catalog`].  The three named databases (`dict_fwd_v2`,
+//! `dict_rev_v2`, `next_dict_id_v2`) are opened by the catalog at startup and
+//! passed to these functions.
 //!
-//! # Tables
+//! # Databases
 //!
-//! | Constant | Key | Value |
+//! | Catalog field | Key | Value |
 //! |---|---|---|
-//! | [`DICT_FWD`] | `external_id` (str) | `u32` internal ID |
-//! | [`DICT_REV`] | `u32` internal ID | external ID string |
-//! | [`NEXT_DICT_ID`] | `()` (unit) | next available `u32` counter |
+//! | `dict_fwd` | `external_id` (Str) | `u32` internal ID (U64) |
+//! | `dict_rev` | `u32` internal ID (U64) | external ID string (Str) |
+//! | `dict_next_id` | `"_"` (Str) | next available `u32` counter (U64) |
 
-use redb::{Database, ReadableTable, TableDefinition};
+use crate::catalog::Catalog;
 
-// ─── Table definitions ────────────────────────────────────────────────────────
-
-/// Forward mapping table: `external_id` → internal `u32`.
-pub(crate) const DICT_FWD: TableDefinition<&str, u32> = TableDefinition::new("dict_fwd_v2");
-
-/// Reverse mapping table: internal `u32` → external ID string.
-pub(crate) const DICT_REV: TableDefinition<u32, &str> = TableDefinition::new("dict_rev_v2");
-
-/// Global monotonic counter table: `()` → next available `u32`.
-pub(crate) const NEXT_DICT_ID: TableDefinition<(), u32> = TableDefinition::new("next_dict_id_v2");
+/// Fixed key used for the singleton next-ID counter.
+const SINGLETON_KEY: &str = "_";
 
 // ─── Helper: read a single forward entry ─────────────────────────────────────
 
 /// Performs a single read-only lookup in the forward table.
 ///
-/// Returns `None` if the key is absent.  Materialises the value before the
-/// transaction and table are dropped, avoiding `AccessGuard` lifetime issues.
-fn read_fwd(db: &Database, external_id: &str) -> crate::Result<Option<u32>> {
-    let rtxn = db.begin_read()?;
-    let fwd = rtxn.open_table(DICT_FWD)?;
-    let v = fwd.get(external_id)?.map(|g| g.value());
+/// Returns `None` if the key is absent.
+fn read_fwd(cat: &Catalog, external_id: &str) -> crate::Result<Option<u32>> {
+    let rtxn = cat.env().read_txn()?;
+    let v = cat.dict_fwd.get(&rtxn, external_id)?.map(|v| v as u32);
     Ok(v)
 }
 
 // ─── Core functions ───────────────────────────────────────────────────────────
-
-/// Ensures that the three dictionary tables exist in `db`.
-///
-/// This should be called once during database initialisation (e.g. inside a
-/// write transaction that also creates other catalog tables).
-///
-/// # Errors
-///
-/// Returns an error on any redb I/O failure.
-pub fn ensure_tables(db: &Database) -> crate::Result<()> {
-    let txn = db.begin_write()?;
-    {
-        txn.open_table(DICT_FWD)?;
-        txn.open_table(DICT_REV)?;
-        txn.open_table(NEXT_DICT_ID)?;
-    }
-    txn.commit()?;
-    Ok(())
-}
 
 /// Returns the internal `u32` for `external_id`, assigning a new one if it has
 /// never been seen before.
@@ -77,39 +49,38 @@ pub fn ensure_tables(db: &Database) -> crate::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error on any redb I/O failure.
-pub fn assign_or_get(db: &Database, external_id: &str) -> crate::Result<u32> {
+/// Returns an error on any LMDB I/O failure.
+pub fn assign_or_get(cat: &Catalog, external_id: &str) -> crate::Result<u32> {
     // Phase 1: optimistic read — avoids a write lock on the common path.
-    if let Some(id) = read_fwd(db, external_id)? {
+    if let Some(id) = read_fwd(cat, external_id)? {
         return Ok(id);
     }
 
     // Phase 2: write transaction with double-check.
-    let wtxn = db.begin_write()?;
-    let id = {
-        let mut fwd = wtxn.open_table(DICT_FWD)?;
-        let mut rev = wtxn.open_table(DICT_REV)?;
-        let mut ctr = wtxn.open_table(NEXT_DICT_ID)?;
+    let mut wtxn = cat.env().write_txn()?;
 
-        // Double-check: another writer may have raced us.
-        let existing = fwd.get(external_id)?.map(|g| g.value());
-        if let Some(id) = existing {
-            id
-        } else {
-            let next = ctr.get(())?.map(|g| g.value()).unwrap_or(0u32);
-            let next_val = next.checked_add(1).ok_or_else(|| {
-                crate::error::InoxSetError::Configuration(
-                    "global dictionary ID space exhausted (u32::MAX)".into(),
-                )
-            })?;
-            fwd.insert(external_id, next)?;
-            rev.insert(next, external_id)?;
-            ctr.insert((), next_val)?;
-            next
-        }
-    };
+    // Double-check: another writer may have raced us.
+    if let Some(id) = cat.dict_fwd.get(&wtxn, external_id)? {
+        return Ok(id as u32);
+    }
+
+    let next = cat.dict_next_id.get(&wtxn, SINGLETON_KEY)?.unwrap_or(0u64);
+    let next_u32 = u32::try_from(next).map_err(|_| {
+        crate::error::InoxSetError::Configuration(
+            "global dictionary ID space exhausted (u32::MAX)".into(),
+        )
+    })?;
+    let next_val = next.checked_add(1).ok_or_else(|| {
+        crate::error::InoxSetError::Configuration(
+            "global dictionary ID space exhausted (u32::MAX)".into(),
+        )
+    })?;
+
+    cat.dict_fwd.put(&mut wtxn, external_id, &next)?;
+    cat.dict_rev.put(&mut wtxn, &next, external_id)?;
+    cat.dict_next_id.put(&mut wtxn, SINGLETON_KEY, &next_val)?;
     wtxn.commit()?;
-    Ok(id)
+    Ok(next_u32)
 }
 
 /// Returns the internal `u32` for `external_id`, or `None` if the external ID
@@ -119,9 +90,9 @@ pub fn assign_or_get(db: &Database, external_id: &str) -> crate::Result<u32> {
 ///
 /// # Errors
 ///
-/// Returns an error on any redb I/O failure.
-pub fn lookup(db: &Database, external_id: &str) -> crate::Result<Option<u32>> {
-    read_fwd(db, external_id)
+/// Returns an error on any LMDB I/O failure.
+pub fn lookup(cat: &Catalog, external_id: &str) -> crate::Result<Option<u32>> {
+    read_fwd(cat, external_id)
 }
 
 /// Returns the external string ID for `internal_id`, or `None` if the internal
@@ -129,12 +100,36 @@ pub fn lookup(db: &Database, external_id: &str) -> crate::Result<Option<u32>> {
 ///
 /// # Errors
 ///
-/// Returns an error on any redb I/O failure.
-pub fn reverse_lookup(db: &Database, internal_id: u32) -> crate::Result<Option<String>> {
-    let rtxn = db.begin_read()?;
-    let rev = rtxn.open_table(DICT_REV)?;
-    let v = rev.get(internal_id)?.map(|g| g.value().to_owned());
+/// Returns an error on any LMDB I/O failure.
+pub fn reverse_lookup(cat: &Catalog, internal_id: u32) -> crate::Result<Option<String>> {
+    let rtxn = cat.env().read_txn()?;
+    let v = cat
+        .dict_rev
+        .get(&rtxn, &(internal_id as u64))?
+        .map(|s| s.to_owned());
     Ok(v)
+}
+
+/// Reverse-lookups a batch of internal IDs in a single read transaction.
+///
+/// More efficient than calling [`reverse_lookup`] in a loop — opens one
+/// transaction for all lookups instead of one per ID.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+pub fn batch_reverse_lookup_u32(
+    cat: &Catalog,
+    internal_ids: impl Iterator<Item = u32>,
+) -> crate::Result<Vec<(u32, String)>> {
+    let rtxn = cat.env().read_txn()?;
+    let mut results = Vec::new();
+    for id in internal_ids {
+        if let Some(s) = cat.dict_rev.get(&rtxn, &(id as u64))? {
+            results.push((id, s.to_owned()));
+        }
+    }
+    Ok(results)
 }
 
 /// Removes the `external_id` entry from both the forward and reverse tables.
@@ -145,23 +140,19 @@ pub fn reverse_lookup(db: &Database, internal_id: u32) -> crate::Result<Option<S
 ///
 /// # Errors
 ///
-/// Returns an error on any redb I/O failure.
-pub fn delete(db: &Database, external_id: &str) -> crate::Result<Option<u32>> {
-    let wtxn = db.begin_write()?;
-    let removed = {
-        let mut fwd = wtxn.open_table(DICT_FWD)?;
-        let mut rev = wtxn.open_table(DICT_REV)?;
+/// Returns an error on any LMDB I/O failure.
+pub fn delete(cat: &Catalog, external_id: &str) -> crate::Result<Option<u32>> {
+    let mut wtxn = cat.env().write_txn()?;
 
-        let existing = fwd.remove(external_id)?.map(|g| g.value());
-        if let Some(id) = existing {
-            rev.remove(id)?;
-            Some(id)
-        } else {
-            None
-        }
-    };
-    wtxn.commit()?;
-    Ok(removed)
+    let existing = cat.dict_fwd.get(&wtxn, external_id)?.map(|v| v as u32);
+    if let Some(id) = existing {
+        cat.dict_fwd.delete(&mut wtxn, external_id)?;
+        cat.dict_rev.delete(&mut wtxn, &(id as u64))?;
+        wtxn.commit()?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
 }
 
 // ─── Batch operations ─────────────────────────────────────────────────────────
@@ -178,16 +169,15 @@ pub fn delete(db: &Database, external_id: &str) -> crate::Result<Option<u32>> {
 ///
 /// # Errors
 ///
-/// Returns an error on any redb I/O failure.
-pub fn batch_assign_or_get(db: &Database, external_ids: &[&str]) -> crate::Result<Vec<u32>> {
+/// Returns an error on any LMDB I/O failure.
+pub fn batch_assign_or_get(cat: &Catalog, external_ids: &[&str]) -> crate::Result<Vec<u32>> {
     let mut result: Vec<Option<u32>> = vec![None; external_ids.len()];
 
-    // Phase 1: read-only pass — materialize all values before dropping the txn.
+    // Phase 1: read-only pass.
     {
-        let rtxn = db.begin_read()?;
-        let fwd = rtxn.open_table(DICT_FWD)?;
+        let rtxn = cat.env().read_txn()?;
         for (i, &ext) in external_ids.iter().enumerate() {
-            result[i] = fwd.get(ext)?.map(|g| g.value());
+            result[i] = cat.dict_fwd.get(&rtxn, ext)?.map(|v| v as u32);
         }
     }
 
@@ -198,39 +188,39 @@ pub fn batch_assign_or_get(db: &Database, external_ids: &[&str]) -> crate::Resul
     }
 
     // Phase 2: write transaction for unknowns, with double-check.
-    let wtxn = db.begin_write()?;
-    {
-        let mut fwd = wtxn.open_table(DICT_FWD)?;
-        let mut rev = wtxn.open_table(DICT_REV)?;
-        let mut ctr = wtxn.open_table(NEXT_DICT_ID)?;
+    let mut wtxn = cat.env().write_txn()?;
 
-        let mut next = ctr.get(())?.map(|g| g.value()).unwrap_or(0u32);
+    let mut next = cat.dict_next_id.get(&wtxn, SINGLETON_KEY)?.unwrap_or(0u64);
 
-        for (i, &ext) in external_ids.iter().enumerate() {
-            if result[i].is_some() {
-                continue;
-            }
-
-            // Double-check: another writer may have inserted while we waited.
-            let existing = fwd.get(ext)?.map(|g| g.value());
-            let id = if let Some(existing_id) = existing {
-                existing_id
-            } else {
-                fwd.insert(ext, next)?;
-                rev.insert(next, ext)?;
-                let assigned = next;
-                next = next.checked_add(1).ok_or_else(|| {
-                    crate::error::InoxSetError::Configuration(
-                        "global dictionary ID space exhausted (u32::MAX)".into(),
-                    )
-                })?;
-                assigned
-            };
-            result[i] = Some(id);
+    for (i, &ext) in external_ids.iter().enumerate() {
+        if result[i].is_some() {
+            continue;
         }
 
-        ctr.insert((), next)?;
+        // Double-check: another writer may have inserted while we waited.
+        let existing = cat.dict_fwd.get(&wtxn, ext)?.map(|v| v as u32);
+        let id = if let Some(existing_id) = existing {
+            existing_id
+        } else {
+            let assigned = u32::try_from(next).map_err(|_| {
+                crate::error::InoxSetError::Configuration(
+                    "global dictionary ID space exhausted (u32::MAX)".into(),
+                )
+            })?;
+            cat.dict_fwd.put(&mut wtxn, ext, &next)?;
+            cat.dict_rev.put(&mut wtxn, &next, ext)?;
+            let a = assigned;
+            next = next.checked_add(1).ok_or_else(|| {
+                crate::error::InoxSetError::Configuration(
+                    "global dictionary ID space exhausted (u32::MAX)".into(),
+                )
+            })?;
+            a
+        };
+        result[i] = Some(id);
     }
+
+    cat.dict_next_id.put(&mut wtxn, SINGLETON_KEY, &next)?;
     wtxn.commit()?;
 
     Ok(result.into_iter().flatten().collect())
@@ -245,17 +235,15 @@ pub fn batch_assign_or_get(db: &Database, external_ids: &[&str]) -> crate::Resul
 ///
 /// # Errors
 ///
-/// Returns an error on any redb I/O failure.
+/// Returns an error on any LMDB I/O failure.
 pub fn batch_reverse_lookup(
-    db: &Database,
+    cat: &Catalog,
     internal_ids: &[u32],
 ) -> crate::Result<Vec<Option<String>>> {
-    let rtxn = db.begin_read()?;
-    let rev = rtxn.open_table(DICT_REV)?;
-
+    let rtxn = cat.env().read_txn()?;
     let mut result = Vec::with_capacity(internal_ids.len());
     for &id in internal_ids {
-        let entry = rev.get(id)?.map(|g| g.value().to_owned());
+        let entry = cat.dict_rev.get(&rtxn, &(id as u64))?.map(|s| s.to_owned());
         result.push(entry);
     }
     Ok(result)
@@ -268,19 +256,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_db() -> (Database, TempDir) {
+    fn test_catalog() -> (Catalog, TempDir) {
         let dir = TempDir::new().unwrap();
-        let db = Database::create(dir.path().join("dict_test.redb")).unwrap();
-        ensure_tables(&db).unwrap();
-        (db, dir)
+        let cat = Catalog::open(dir.path().join("dict_test.mdb")).unwrap();
+        (cat, dir)
     }
 
     #[test]
     fn assign_or_get_global() {
-        let (db, _dir) = test_db();
-        let id0 = assign_or_get(&db, "user-abc-123").unwrap();
-        let id1 = assign_or_get(&db, "user-def-456").unwrap();
-        let id0_again = assign_or_get(&db, "user-abc-123").unwrap();
+        let (cat, _dir) = test_catalog();
+        let id0 = assign_or_get(&cat, "user-abc-123").unwrap();
+        let id1 = assign_or_get(&cat, "user-def-456").unwrap();
+        let id0_again = assign_or_get(&cat, "user-abc-123").unwrap();
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(id0_again, 0);
@@ -288,29 +275,27 @@ mod tests {
 
     #[test]
     fn same_id_regardless_of_usage_context() {
-        let (db, _dir) = test_db();
-        // The same external string must resolve to the same u32 regardless of
-        // which event it is logically associated with at the call site.
-        let id_clicks = assign_or_get(&db, "user-1").unwrap();
-        let id_views = assign_or_get(&db, "user-1").unwrap();
+        let (cat, _dir) = test_catalog();
+        let id_clicks = assign_or_get(&cat, "user-1").unwrap();
+        let id_views = assign_or_get(&cat, "user-1").unwrap();
         assert_eq!(id_clicks, id_views);
         assert_eq!(id_clicks, 0);
     }
 
     #[test]
     fn batch_assign_or_get_global() {
-        let (db, _dir) = test_db();
-        let ids = batch_assign_or_get(&db, &["aaa", "bbb", "ccc"]).unwrap();
+        let (cat, _dir) = test_catalog();
+        let ids = batch_assign_or_get(&cat, &["aaa", "bbb", "ccc"]).unwrap();
         assert_eq!(ids, vec![0, 1, 2]);
-        let ids2 = batch_assign_or_get(&db, &["bbb", "ddd", "aaa"]).unwrap();
+        let ids2 = batch_assign_or_get(&cat, &["bbb", "ddd", "aaa"]).unwrap();
         assert_eq!(ids2, vec![1, 3, 0]);
     }
 
     #[test]
     fn batch_reverse_lookup_global() {
-        let (db, _dir) = test_db();
-        batch_assign_or_get(&db, &["alice", "bob", "charlie"]).unwrap();
-        let names = batch_reverse_lookup(&db, &[2, 0, 1]).unwrap();
+        let (cat, _dir) = test_catalog();
+        batch_assign_or_get(&cat, &["alice", "bob", "charlie"]).unwrap();
+        let names = batch_reverse_lookup(&cat, &[2, 0, 1]).unwrap();
         assert_eq!(
             names,
             vec![
@@ -319,30 +304,27 @@ mod tests {
                 Some("bob".to_string()),
             ]
         );
-        let missing = batch_reverse_lookup(&db, &[99]).unwrap();
+        let missing = batch_reverse_lookup(&cat, &[99]).unwrap();
         assert_eq!(missing, vec![None]);
     }
 
     #[test]
     fn delete_removes_both_directions() {
-        let (db, _dir) = test_db();
-        let id = assign_or_get(&db, "to-delete").unwrap();
+        let (cat, _dir) = test_catalog();
+        let id = assign_or_get(&cat, "to-delete").unwrap();
         assert_eq!(id, 0);
 
-        // Verify forward and reverse both exist.
-        assert_eq!(lookup(&db, "to-delete").unwrap(), Some(0));
+        assert_eq!(lookup(&cat, "to-delete").unwrap(), Some(0));
         assert_eq!(
-            reverse_lookup(&db, 0).unwrap(),
+            reverse_lookup(&cat, 0).unwrap(),
             Some("to-delete".to_string())
         );
 
-        // Delete and confirm both directions are gone.
-        let removed = delete(&db, "to-delete").unwrap();
+        let removed = delete(&cat, "to-delete").unwrap();
         assert_eq!(removed, Some(0));
-        assert_eq!(lookup(&db, "to-delete").unwrap(), None);
-        assert_eq!(reverse_lookup(&db, 0).unwrap(), None);
+        assert_eq!(lookup(&cat, "to-delete").unwrap(), None);
+        assert_eq!(reverse_lookup(&cat, 0).unwrap(), None);
 
-        // Deleting a non-existent entry returns None.
-        assert_eq!(delete(&db, "never-existed").unwrap(), None);
+        assert_eq!(delete(&cat, "never-existed").unwrap(), None);
     }
 }

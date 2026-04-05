@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn build_empty_catalog() {
         let dir = TempDir::new().unwrap();
-        let cat = Catalog::open(dir.path().join("catalog.redb")).unwrap();
+        let cat = Catalog::open(dir.path().join("catalog.mdb")).unwrap();
         let idx = ReadIndex::build(&cat).unwrap();
         assert!(idx.periods.is_empty());
         assert!(idx.event_names.is_empty());

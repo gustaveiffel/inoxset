@@ -12,29 +12,13 @@ use crate::types::{Granularity, Period};
 /// The top-level error type for all inoxset operations.
 ///
 /// Variants cover catalog I/O, bitmap file I/O, event lifecycle, and
-/// configuration mismatches.  Catalog-layer errors from `redb` are wrapped
+/// configuration mismatches.  Catalog-layer errors from `heed` are wrapped
 /// via `#[from]` so the `?` operator works transparently in catalog code.
 #[derive(Debug, thiserror::Error)]
 pub enum InoxSetError {
-    /// Wraps a generic [`redb::Error`] returned by the catalog layer.
+    /// Wraps a [`heed::Error`] returned by the catalog layer (LMDB backend).
     #[error("catalog error: {0}")]
-    Catalog(#[from] redb::Error),
-
-    /// Wraps a [`redb::TransactionError`] from catalog transaction management.
-    #[error("catalog transaction error: {0}")]
-    CatalogTransaction(#[from] redb::TransactionError),
-
-    /// Wraps a [`redb::TableError`] from catalog table access.
-    #[error("catalog table error: {0}")]
-    CatalogTable(#[from] redb::TableError),
-
-    /// Wraps a [`redb::StorageError`] from low-level catalog storage.
-    #[error("catalog storage error: {0}")]
-    CatalogStorage(#[from] redb::StorageError),
-
-    /// Wraps a [`redb::CommitError`] from catalog transaction commit.
-    #[error("catalog commit error: {0}")]
-    CatalogCommit(#[from] redb::CommitError),
+    Catalog(#[from] heed::Error),
 
     /// Bitmap file could not be read or written.
     ///

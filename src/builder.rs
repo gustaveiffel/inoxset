@@ -28,6 +28,17 @@ use crate::types::{Granularity, IndexFreshness, Rollup};
 /// Default mempart flush threshold: 16 MiB.
 const DEFAULT_FLUSH_THRESHOLD: u64 = 16 * 1024 * 1024;
 
+/// Default LMDB map size: platform-aware (64 MiB macOS, 256 MiB Linux).
+/// macOS APFS doesn't support sparse files, so the full map_size is
+/// allocated on disk.
+fn default_map_size() -> usize {
+    if cfg!(target_os = "macos") {
+        64 * 1024 * 1024
+    } else {
+        256 * 1024 * 1024
+    }
+}
+
 /// Fluent builder for opening an [`InoxSet`](crate::InoxSet) store.
 ///
 /// Call [`InoxSetBuilder::new`] (or [`InoxSet::builder`](crate::InoxSet::builder)),
@@ -44,6 +55,7 @@ const DEFAULT_FLUSH_THRESHOLD: u64 = 16 * 1024 * 1024;
 /// | `mempart_flush_threshold` | 16 MiB |
 /// | `max_events` | 0 (unlimited) |
 /// | `read_only` | `false` |
+/// | `map_size` | 64 MiB (macOS) / 256 MiB (Linux) |
 /// | `clock` | `SystemTime` UTC seconds |
 pub struct InoxSetBuilder {
     path: Option<PathBuf>,
@@ -55,6 +67,7 @@ pub struct InoxSetBuilder {
     read_only: bool,
     clock: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
     index_freshness: IndexFreshness,
+    map_size: usize,
 }
 
 impl InoxSetBuilder {
@@ -70,6 +83,7 @@ impl InoxSetBuilder {
             read_only: false,
             clock: None,
             index_freshness: IndexFreshness::Disabled,
+            map_size: default_map_size(),
         }
     }
 
@@ -139,6 +153,15 @@ impl InoxSetBuilder {
         self
     }
 
+    /// Sets the maximum size of the LMDB memory-mapped region.
+    ///
+    /// This controls the upper bound on the catalog database size.
+    /// Defaults to 256 MiB.
+    pub fn map_size(mut self, bytes: usize) -> Self {
+        self.map_size = bytes;
+        self
+    }
+
     /// Sets the freshness strategy for the inverted index.
     ///
     /// The inverted index enables sub-microsecond reverse membership lookups
@@ -155,7 +178,7 @@ impl InoxSetBuilder {
     ///
     /// 1. Validate that a path was provided.
     /// 2. Create the store directory (and `parts/` sub-directory) if needed.
-    /// 3. Open the catalog database (`catalog.redb`).
+    /// 3. Open the catalog database (`catalog.mdb`).
     /// 4. Initialise an empty in-memory write buffer ([`MemPart`]).
     /// 5. Unless `read_only`, scan for orphan part files left by a previous
     ///    crashed process and delete them.
@@ -179,9 +202,9 @@ impl InoxSetBuilder {
             source: e,
         })?;
 
-        // 3. Open catalog.
-        let catalog_path = path.join("catalog.redb");
-        let catalog = catalog::Catalog::open(&catalog_path)?;
+        // 3. Open catalog (LMDB environment stored in a sub-directory).
+        let catalog_path = path.join("catalog.mdb");
+        let catalog = catalog::Catalog::open_with_map_size(&catalog_path, self.map_size)?;
 
         // 4. Create empty MemPart.
         let mempart = MemPart::new();
@@ -263,7 +286,7 @@ mod tests {
             .path(dir.path().join("data"))
             .open()
             .unwrap();
-        assert!(dir.path().join("data/catalog.redb").exists());
+        assert!(dir.path().join("data/catalog.mdb").exists());
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub struct InoxSet {
     pub(crate) parts_root: PathBuf,
     pub(crate) catalog: catalog::Catalog,
     pub(crate) writer: RwLock<mempart::MemPart>,
-    /// Lock-free read index — caches catalog metadata to skip redb lookups.
+    /// Lock-free read index — caches catalog metadata to skip LMDB lookups.
     pub(crate) ridx: ArcSwap<read_index::ReadIndex>,
     pub(crate) default_granularity: types::Granularity,
     pub(crate) default_rollup: types::Rollup,
@@ -145,7 +145,11 @@ impl InoxSet {
 
         let mut builder = inverted::InvertedIndexBuilder::new(event_names, periods_vec);
 
-        // For each (event, period), read bitmap, reverse-lookup each u32 → external_id.
+        // For each (event, period), read bitmap, reverse-lookup u32 → external_id.
+        // Collect all (event_id, period_id, u32) first, then batch reverse-lookup
+        // in a single LMDB read transaction to avoid 6M+ individual txn opens.
+        let mut pending: Vec<(u16, u16, u32)> = Vec::new();
+
         for ((ev, period), entry) in &ridx.periods {
             let event_id = event_map[ev];
             let period_id = period_map[period];
@@ -164,9 +168,19 @@ impl InoxSet {
             }
 
             for internal_id in bm.iter() {
-                if let Ok(Some(ext_id)) = dict::reverse_lookup(self.catalog.db(), internal_id) {
-                    builder.add(&ext_id, event_id, period_id);
-                }
+                pending.push((event_id, period_id, internal_id));
+            }
+        }
+
+        // Batch reverse-lookup: one read txn for all IDs.
+        let unique_ids = pending.iter().map(|(_, _, id)| *id);
+        let resolved = dict::batch_reverse_lookup_u32(&self.catalog, unique_ids)?;
+        let id_to_ext: std::collections::HashMap<u32, &str> =
+            resolved.iter().map(|(id, s)| (*id, s.as_str())).collect();
+
+        for (event_id, period_id, internal_id) in &pending {
+            if let Some(ext_id) = id_to_ext.get(internal_id) {
+                builder.add(ext_id, *event_id, *period_id);
             }
         }
 
@@ -408,23 +422,7 @@ impl InoxSet {
                     log::error!("RwLock poisoned: {e}");
                     InoxSetError::Closed
                 })?;
-<<<<<<< HEAD
-                // For unflushed data, we need dict lookups per event.
-                let events = &idx.meta().event_names;
-                for ev in events {
-                    if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
-                        for ((ev_name, period), bm) in &mp.bitmaps {
-                            if ev_name == ev && bm.contains(internal_id) {
-                                let deltad = mp
-                                    .get_delta(ev, period)
-                                    .is_some_and(|d| d.contains(internal_id));
-                                if !deltad
-                                    && !memberships.iter().any(|(e, p)| e == ev && p == period)
-                                {
-                                    memberships.push((ev.clone(), *period));
-                                }
-=======
-                if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+                if let Some(internal_id) = dict::lookup(&self.catalog, external_id)? {
                     for ((ev_name, period), bm) in &mp.bitmaps {
                         if bm.contains(internal_id) {
                             let deltad = mp
@@ -434,17 +432,14 @@ impl InoxSet {
                                 && !memberships.iter().any(|(e, p)| e == ev_name && p == period)
                             {
                                 memberships.push((ev_name.clone(), *period));
->>>>>>> 003e6d8 (fix: code review — mempart delta checks, overflow guard, inverted delta subtraction)
                             }
                         }
                     }
                 }
-<<<<<<< HEAD
-=======
             }
 
             // Filter out memberships tombstoned in mempart.
-            if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+            if let Some(internal_id) = dict::lookup(&self.catalog, external_id)? {
                 let mp = self.writer.read().map_err(|e| {
                     log::error!("RwLock poisoned: {e}");
                     InoxSetError::Closed
@@ -456,7 +451,6 @@ impl InoxSet {
             } else {
                 // Dict entry deleted (e.g. by delete_entity) — no memberships.
                 memberships.clear();
->>>>>>> 003e6d8 (fix: code review — mempart delta checks, overflow guard, inverted delta subtraction)
             }
 
             return Ok(memberships);
@@ -470,7 +464,7 @@ impl InoxSet {
         // Phase 1: resolve dict IDs per event.
         let mut event_ids: Vec<(String, u32)> = Vec::new();
         for ev in &idx.event_names {
-            if let Some(id) = dict::lookup(self.catalog.db(), external_id)? {
+            if let Some(id) = dict::lookup(&self.catalog, external_id)? {
                 event_ids.push((ev.clone(), id));
             }
         }
@@ -478,7 +472,7 @@ impl InoxSet {
             return Ok(Vec::new());
         }
 
-        // Phase 2: scan the in-memory index — zero redb lookups.
+        // Phase 2: scan the in-memory index — zero LMDB lookups.
         let mut memberships = Vec::new();
         let mut file_cache: std::collections::HashMap<PathBuf, Vec<u8>> =
             std::collections::HashMap::new();
@@ -578,7 +572,7 @@ impl InoxSet {
             let found = idx.contains(external_id, event, &period);
             if found {
                 // Check mempart delta — entity may have been tombstoned after last flush.
-                if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+                if let Some(internal_id) = dict::lookup(&self.catalog, external_id)? {
                     let mp = self.writer.read().map_err(|e| {
                         log::error!("RwLock poisoned: {e}");
                         InoxSetError::Closed
@@ -593,7 +587,7 @@ impl InoxSet {
                 return Ok(true);
             }
             // Check mempart for unflushed data.
-            if let Some(internal_id) = dict::lookup(self.catalog.db(), external_id)? {
+            if let Some(internal_id) = dict::lookup(&self.catalog, external_id)? {
                 let mp = self.writer.read().map_err(|e| {
                     log::error!("RwLock poisoned: {e}");
                     InoxSetError::Closed
@@ -611,7 +605,7 @@ impl InoxSet {
         }
 
         // Disabled mode: existing path.
-        let internal_id = match dict::lookup(self.catalog.db(), external_id)? {
+        let internal_id = match dict::lookup(&self.catalog, external_id)? {
             Some(id) => id,
             None => return Ok(false),
         };
@@ -652,7 +646,7 @@ impl InoxSet {
             }
         }
 
-        // Check disk parts via read index (zero redb lookups).
+        // Check disk parts via read index (zero LMDB lookups).
         let idx = self.ridx.load();
         let key = (event.to_string(), period);
 
@@ -712,7 +706,7 @@ impl InoxSet {
         if external_ids.is_empty() {
             return Ok(());
         }
-        let internal_ids = dict::batch_assign_or_get(self.catalog.db(), external_ids)?;
+        let internal_ids = dict::batch_assign_or_get(&self.catalog, external_ids)?;
         let mut bitmap = RoaringBitmap::new();
         for id in internal_ids {
             bitmap.insert(id);
@@ -732,7 +726,7 @@ impl InoxSet {
     pub fn get_ids(&self, event: &str, period: Period) -> Result<Vec<String>> {
         let bitmap = self.get(event, period)?;
         let internal_ids: Vec<u32> = bitmap.iter().collect();
-        let resolved = dict::batch_reverse_lookup(self.catalog.db(), &internal_ids)?;
+        let resolved = dict::batch_reverse_lookup(&self.catalog, &internal_ids)?;
         Ok(resolved.into_iter().flatten().collect())
     }
 
@@ -753,7 +747,7 @@ impl InoxSet {
         }
         let mut bits: Vec<u32> = Vec::new();
         for ext_id in external_ids {
-            if let Some(internal) = dict::lookup(self.catalog.db(), ext_id)? {
+            if let Some(internal) = dict::lookup(&self.catalog, ext_id)? {
                 bits.push(internal);
             }
         }
@@ -763,8 +757,6 @@ impl InoxSet {
         self.remove_bits(event, period, &bits)
     }
 
-<<<<<<< HEAD
-=======
     /// Deletes an entity from all events and periods, then removes
     /// its dictionary entry.
     ///
@@ -774,7 +766,7 @@ impl InoxSet {
     ///
     /// Returns the number of (event, period) pairs the entity was removed from.
     ///
-    /// **Note:** The dictionary entry is deleted immediately (durable in redb),
+    /// **Note:** The dictionary entry is deleted immediately (durable in LMDB),
     /// but bitmap tombstones are written to the mempart and require a
     /// [`flush`](Self::flush) call to become durable on disk. If the process
     /// crashes between `delete_entity` and `flush`, the bitmap bits will
@@ -795,12 +787,11 @@ impl InoxSet {
         }
 
         // Remove dictionary entry.
-        dict::delete(self.catalog.db(), external_id)?;
+        dict::delete(&self.catalog, external_id)?;
 
         Ok(count)
     }
 
->>>>>>> 003e6d8 (fix: code review — mempart delta checks, overflow guard, inverted delta subtraction)
     /// Looks up an event by name, auto-registering it with defaults if it
     /// doesn't exist.
     ///
@@ -951,15 +942,13 @@ impl InoxSet {
         let total_parts = snapshot.bitmaps.len() + snapshot.deltas.len();
 
         // Single atomic transaction for all catalog updates.
-        let txn = self.catalog.db().begin_write()?;
+        let mut txn = self.catalog.env().write_txn()?;
         {
-            let mut next_id_table = txn.open_table(catalog::NEXT_PART_ID)?;
-            let mut parts_table = txn.open_table(catalog::PARTS)?;
-            let mut pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(catalog::PERIOD_STATE)?;
-
-            let ids = Catalog::txn_alloc_part_ids(&mut next_id_table, total_parts as u64)?;
+            let ids = Catalog::txn_alloc_part_ids(
+                &self.catalog.next_part_id,
+                &mut txn,
+                total_parts as u64,
+            )?;
             let mut id_iter = ids.into_iter();
 
             let now = self.now_unix();
@@ -1003,14 +992,27 @@ impl InoxSet {
                     level: 0,
                 };
 
-                Catalog::txn_register_part(&mut parts_table, &part)?;
+                Catalog::txn_register_part(&self.catalog.parts, &mut txn, &part)?;
 
                 let cat_key = catalog_key(event, period.granularity(), period);
-                Catalog::txn_append_period_parts(&mut pp_table, &cat_key, &[part_id])?;
+                Catalog::txn_append_period_parts(
+                    &self.catalog.period_parts,
+                    &mut txn,
+                    &cat_key,
+                    &[part_id],
+                )?;
 
                 // Ensure period state is at least Open.
-                if Catalog::txn_get_period_state(&ps_table, &cat_key)?.is_none() {
-                    Catalog::txn_set_period_state(&mut ps_table, &cat_key, PeriodState::Open)?;
+                let rtxn_ref: &heed::RoTxn = &txn;
+                if Catalog::txn_get_period_state(&self.catalog.period_state, rtxn_ref, &cat_key)?
+                    .is_none()
+                {
+                    Catalog::txn_set_period_state(
+                        &self.catalog.period_state,
+                        &mut txn,
+                        &cat_key,
+                        PeriodState::Open,
+                    )?;
                 }
 
                 data_parts_written += 1;
@@ -1055,10 +1057,15 @@ impl InoxSet {
                     level: 0,
                 };
 
-                Catalog::txn_register_part(&mut parts_table, &part)?;
+                Catalog::txn_register_part(&self.catalog.parts, &mut txn, &part)?;
 
                 let cat_key = catalog_key(event, period.granularity(), period);
-                Catalog::txn_append_period_deltas(&mut pd_table, &cat_key, &[part_id])?;
+                Catalog::txn_append_period_deltas(
+                    &self.catalog.period_deltas,
+                    &mut txn,
+                    &cat_key,
+                    &[part_id],
+                )?;
 
                 delta_parts_written += 1;
                 total_bytes += size_bytes;
@@ -1116,18 +1123,17 @@ impl InoxSet {
 
         // Slow path: read from disk via catalog.
         let cat_key = catalog_key(event, period.granularity(), &period);
-        let txn = self.catalog.db().begin_read()?;
-        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-        let parts_table = txn.open_table(catalog::PARTS)?;
+        let txn = self.catalog.env().read_txn()?;
 
-        let data_part_ids = Catalog::txn_get_period_parts(&pp_table, &cat_key)?;
-        let delta_part_ids = Catalog::txn_get_period_deltas(&pd_table, &cat_key)?;
+        let data_part_ids =
+            Catalog::txn_get_period_parts(&self.catalog.period_parts, &txn, &cat_key)?;
+        let delta_part_ids =
+            Catalog::txn_get_period_deltas(&self.catalog.period_deltas, &txn, &cat_key)?;
 
         // OR all data parts from disk.
         let mut result = RoaringBitmap::new();
         for pid in &data_part_ids {
-            if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
+            if let Some(part) = Catalog::txn_get_part(&self.catalog.parts, &txn, *pid)? {
                 let bm = part_store::mmap_read_part(&part.file_path).map_err(|e| match e {
                     InoxSetError::BitmapCorrupted { .. } => InoxSetError::BitmapCorrupted {
                         event: event.to_string(),
@@ -1147,7 +1153,7 @@ impl InoxSet {
         // Collect disk deltas.
         let mut all_deltas = RoaringBitmap::new();
         for pid in &delta_part_ids {
-            if let Some(part) = Catalog::txn_get_part(&parts_table, *pid)? {
+            if let Some(part) = Catalog::txn_get_part(&self.catalog.parts, &txn, *pid)? {
                 let bm = part_store::mmap_read_part(&part.file_path).map_err(|e| match e {
                     InoxSetError::BitmapCorrupted { .. } => InoxSetError::BitmapCorrupted {
                         event: event.to_string(),
@@ -1414,17 +1420,11 @@ impl InoxSet {
 
         // Write new part file.
         let now = self.now_unix();
-        let txn = self.catalog.db().begin_write()?;
+        let mut txn = self.catalog.env().write_txn()?;
         let new_part_id;
         let new_file_path;
         {
-            let mut next_id_table = txn.open_table(catalog::NEXT_PART_ID)?;
-            let mut parts_table = txn.open_table(catalog::PARTS)?;
-            let mut pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(catalog::PERIOD_STATE)?;
-
-            let ids = Catalog::txn_alloc_part_ids(&mut next_id_table, 1)?;
+            let ids = Catalog::txn_alloc_part_ids(&self.catalog.next_part_id, &mut txn, 1)?;
             new_part_id = ids[0];
 
             new_file_path = part_store::part_file_path(
@@ -1456,22 +1456,35 @@ impl InoxSet {
             };
 
             // Register new part.
-            Catalog::txn_register_part(&mut parts_table, &part)?;
+            Catalog::txn_register_part(&self.catalog.parts, &mut txn, &part)?;
 
             // Set period parts to only the new part.
-            Catalog::txn_set_period_parts(&mut pp_table, &cat_key, &[new_part_id])?;
+            Catalog::txn_set_period_parts(
+                &self.catalog.period_parts,
+                &mut txn,
+                &cat_key,
+                &[new_part_id],
+            )?;
 
             // Clear deltas.
-            Catalog::txn_clear_period_deltas(&mut pd_table, &cat_key)?;
+            Catalog::txn_clear_period_deltas(&self.catalog.period_deltas, &mut txn, &cat_key)?;
 
             // Ensure period state exists.
-            if Catalog::txn_get_period_state(&ps_table, &cat_key)?.is_none() {
-                Catalog::txn_set_period_state(&mut ps_table, &cat_key, PeriodState::Open)?;
+            let rtxn_ref: &heed::RoTxn = &txn;
+            if Catalog::txn_get_period_state(&self.catalog.period_state, rtxn_ref, &cat_key)?
+                .is_none()
+            {
+                Catalog::txn_set_period_state(
+                    &self.catalog.period_state,
+                    &mut txn,
+                    &cat_key,
+                    PeriodState::Open,
+                )?;
             }
 
             // Remove old part entries.
             for &pid in old_data_ids.iter().chain(old_delta_ids.iter()) {
-                parts_table.remove(pid)?;
+                self.catalog.parts.delete(&mut txn, &pid)?;
             }
         }
         txn.commit()?;
@@ -1533,15 +1546,13 @@ impl InoxSet {
         }
 
         let now = self.now_unix();
-        let txn = self.catalog.db().begin_write()?;
+        let mut txn = self.catalog.env().write_txn()?;
         {
-            let mut next_id_table = txn.open_table(catalog::NEXT_PART_ID)?;
-            let mut parts_table = txn.open_table(catalog::PARTS)?;
-            let mut pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(catalog::PERIOD_STATE)?;
-
-            let ids = Catalog::txn_alloc_part_ids(&mut next_id_table, entries.len() as u64)?;
+            let ids = Catalog::txn_alloc_part_ids(
+                &self.catalog.next_part_id,
+                &mut txn,
+                entries.len() as u64,
+            )?;
 
             for (i, (period, bitmap)) in entries.iter().enumerate() {
                 let part_id = ids[i];
@@ -1575,17 +1586,30 @@ impl InoxSet {
                     level: 0,
                 };
 
-                Catalog::txn_register_part(&mut parts_table, &part)?;
-                Catalog::txn_set_period_parts(&mut pp_table, cat_key, &[part_id])?;
-                Catalog::txn_clear_period_deltas(&mut pd_table, cat_key)?;
+                Catalog::txn_register_part(&self.catalog.parts, &mut txn, &part)?;
+                Catalog::txn_set_period_parts(
+                    &self.catalog.period_parts,
+                    &mut txn,
+                    cat_key,
+                    &[part_id],
+                )?;
+                Catalog::txn_clear_period_deltas(&self.catalog.period_deltas, &mut txn, cat_key)?;
 
-                if Catalog::txn_get_period_state(&ps_table, cat_key)?.is_none() {
-                    Catalog::txn_set_period_state(&mut ps_table, cat_key, PeriodState::Open)?;
+                let rtxn_ref: &heed::RoTxn = &txn;
+                if Catalog::txn_get_period_state(&self.catalog.period_state, rtxn_ref, cat_key)?
+                    .is_none()
+                {
+                    Catalog::txn_set_period_state(
+                        &self.catalog.period_state,
+                        &mut txn,
+                        cat_key,
+                        PeriodState::Open,
+                    )?;
                 }
 
                 // Remove old part entries from parts table.
                 for &pid in old_data_ids.iter().chain(old_delta_ids.iter()) {
-                    parts_table.remove(pid)?;
+                    self.catalog.parts.delete(&mut txn, &pid)?;
                 }
             }
         }
@@ -1712,15 +1736,9 @@ impl InoxSet {
         // Allocate new part ID and write merged file.
         let now = self.now_unix();
         let new_part_size: u64;
-        let txn = self.catalog.db().begin_write()?;
+        let mut txn = self.catalog.env().write_txn()?;
         {
-            let mut next_id_table = txn.open_table(catalog::NEXT_PART_ID)?;
-            let mut parts_table = txn.open_table(catalog::PARTS)?;
-            let mut pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-            let mut pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-            let mut ps_table = txn.open_table(catalog::PERIOD_STATE)?;
-
-            let ids = Catalog::txn_alloc_part_ids(&mut next_id_table, 1)?;
+            let ids = Catalog::txn_alloc_part_ids(&self.catalog.next_part_id, &mut txn, 1)?;
             let new_id = ids[0];
 
             let max_level = old_parts.iter().map(|p| p.level).max().unwrap_or(0);
@@ -1753,16 +1771,26 @@ impl InoxSet {
                 level: max_level.saturating_add(1),
             };
 
-            Catalog::txn_register_part(&mut parts_table, &part)?;
-            Catalog::txn_set_period_parts(&mut pp_table, cat_key, &[new_id])?;
-            Catalog::txn_clear_period_deltas(&mut pd_table, cat_key)?;
+            Catalog::txn_register_part(&self.catalog.parts, &mut txn, &part)?;
+            Catalog::txn_set_period_parts(
+                &self.catalog.period_parts,
+                &mut txn,
+                cat_key,
+                &[new_id],
+            )?;
+            Catalog::txn_clear_period_deltas(&self.catalog.period_deltas, &mut txn, cat_key)?;
 
             // Update period state to Compacted.
-            Catalog::txn_set_period_state(&mut ps_table, cat_key, PeriodState::Compacted)?;
+            Catalog::txn_set_period_state(
+                &self.catalog.period_state,
+                &mut txn,
+                cat_key,
+                PeriodState::Compacted,
+            )?;
 
             // Remove old part entries.
             for old in &old_parts {
-                parts_table.remove(old.part_id)?;
+                self.catalog.parts.delete(&mut txn, &old.part_id)?;
             }
         }
         txn.commit()?;
@@ -1814,17 +1842,31 @@ impl InoxSet {
         let mut periods_needing_compaction = 0u32;
 
         // Single batched read transaction for all per-period lookups (I1 fix).
-        let txn = self.catalog.db().begin_read()?;
-        let pp_table = txn.open_table(catalog::PERIOD_PARTS)?;
-        let pd_table = txn.open_table(catalog::PERIOD_DELTAS)?;
-        let ps_table = txn.open_table(catalog::PERIOD_STATE)?;
-        let parts_table = txn.open_table(catalog::PARTS)?;
+        let txn = self.catalog.env().read_txn()?;
 
         for ev in &events {
-            let keys = self.catalog.period_keys_for_event(&ev.name)?;
+            // Inline period_keys_for_event to reuse the existing read txn
+            // (LMDB does not allow nested read transactions on the same thread).
+            let prefix = format!("{}/", ev.name);
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for result in self.catalog.period_parts.iter(&txn)? {
+                let (k, _) = result?;
+                if k.starts_with(&prefix) {
+                    seen.insert(k.to_string());
+                }
+            }
+            for result in self.catalog.period_deltas.iter(&txn)? {
+                let (k, _) = result?;
+                if k.starts_with(&prefix) {
+                    seen.insert(k.to_string());
+                }
+            }
+            let keys: Vec<String> = seen.into_iter().collect();
             for key in &keys {
-                let data_ids = Catalog::txn_get_period_parts(&pp_table, key)?;
-                let delta_ids = Catalog::txn_get_period_deltas(&pd_table, key)?;
+                let data_ids =
+                    Catalog::txn_get_period_parts(&self.catalog.period_parts, &txn, key)?;
+                let delta_ids =
+                    Catalog::txn_get_period_deltas(&self.catalog.period_deltas, &txn, key)?;
 
                 total_data_parts += data_ids.len() as u64;
                 total_delta_parts += delta_ids.len() as u64;
@@ -1835,13 +1877,15 @@ impl InoxSet {
 
                 // Count disk usage.
                 for &pid in data_ids.iter().chain(delta_ids.iter()) {
-                    if let Some(part) = Catalog::txn_get_part(&parts_table, pid)? {
+                    if let Some(part) = Catalog::txn_get_part(&self.catalog.parts, &txn, pid)? {
                         disk_usage_bytes += part.size_bytes;
                     }
                 }
 
                 // Count period states.
-                if let Some(state) = Catalog::txn_get_period_state(&ps_table, key)? {
+                if let Some(state) =
+                    Catalog::txn_get_period_state(&self.catalog.period_state, &txn, key)?
+                {
                     match state {
                         PeriodState::Open => open_periods += 1,
                         PeriodState::Closed => closed_periods += 1,
@@ -2802,5 +2846,42 @@ mod tests {
         assert!(!store
             .contains_id("seg", Period::Day(2026, 4, 2), "alice")
             .unwrap());
+    }
+
+    #[test]
+    fn delete_entity_removes_from_all_segments() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .index_freshness(crate::types::IndexFreshness::OnFlush)
+            .open()
+            .unwrap();
+
+        store
+            .put_ids("seg_a", Period::Day(2026, 4, 1), &["alice", "bob"])
+            .unwrap();
+        store
+            .put_ids("seg_b", Period::Day(2026, 4, 1), &["alice", "charlie"])
+            .unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(store.find_memberships("alice").unwrap().len(), 2);
+
+        let deleted = store.delete_entity("alice").unwrap();
+        assert_eq!(deleted, 2);
+
+        assert!(store.find_memberships("alice").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_entity_unknown_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let store = InoxSet::builder()
+            .path(dir.path().join("data"))
+            .open()
+            .unwrap();
+
+        let deleted = store.delete_entity("nobody").unwrap();
+        assert_eq!(deleted, 0);
     }
 }

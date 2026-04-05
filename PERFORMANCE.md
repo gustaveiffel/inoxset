@@ -10,11 +10,11 @@ Detailed benchmark results, flamegraph analysis, and competitive comparison for 
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
-| `put_bitmap` (1K bits) | 2.3 µs | In-memory accumulation |
-| `get` (compacted, 10K bits) | **242 ns** | Served from bitmap cache |
-| `get` (compacted, 100K bits) | **426 ns** | Served from bitmap cache |
-| `put_ids` (1K string IDs) | **207 µs** | Global dictionary + bitmap |
-| `get_ids` (1K string IDs) | **103 µs** | Bitmap + reverse dict |
+| `put_bitmap` (1K bits) | 1.9 µs | In-memory accumulation |
+| `get` (compacted, 10K bits) | **228 ns** | Served from bitmap cache |
+| `get` (compacted, 100K bits) | **420 ns** | Served from bitmap cache |
+| `put_ids` (1K string IDs) | **115 µs** | Global dictionary (LMDB) + bitmap |
+| `get_ids` (1K string IDs) | **147 µs** | Bitmap + reverse dict |
 | `find_memberships` hit (600 checks) | **29 µs** | Inverted index, bloom+roaring+flat array |
 | `find_memberships` miss | **30 ns** | Bloom filter L1 rejects |
 | Intersection (10K ∩ 10K) | **784 ns** | Bitmap cache + Roaring AND |
@@ -28,12 +28,13 @@ Detailed benchmark results, flamegraph analysis, and competitive comparison for 
 
 inoxset uses a global dictionary (one u32 per external_id across all events) and Roaring Bitmap compression.
 
-| Scenario | Total disk | Catalog (redb) | Parts (.roar) | Amplification |
+| Scenario | Total disk | Catalog (LMDB) | Parts (.roar) | Amplification |
 |----------|-----------|----------------|---------------|--------------|
-| 20 events × 30 days × 10K users | 7.2 MB | 2.5 MB | 4.7 MB | 63x |
-| 50 events × 30 days × 100K users | 40 MB | 16.6 MB | 23.5 MB | 35x |
+| 5 events × 7 days × 1K users | 301 KB | 232 KB | 69 KB | 153x |
+| 20 events × 30 days × 10K users | 5.9 MB | 1.2 MB | 4.7 MB | 51x |
+| 50 events × 30 days × 100K users | 31.5 MB | 8.0 MB | 23.5 MB | 27.5x |
 
-Roaring compression: 1.3 bits/user at 100K scale (sequential IDs). The catalog stores dictionary mappings and part metadata in redb B-tree format.
+Roaring compression: 1.3 bits/user at 100K scale (sequential IDs). The catalog stores dictionary mappings and part metadata in LMDB (B+tree, mmap, copy-on-write).
 
 Profile disk usage: `cargo run --example profile_amplification --release`
 
@@ -107,7 +108,7 @@ Compared on the same machine, localhost. Redis 7.x, [bitmapist-server](https://g
 
 | | inoxset | Redis (pipeline) | bitmapist-server | Factor |
 |---|---|---|---|---|
-| Latency | **2.3 µs** | 1.19 ms | 2.60 ms | **500x vs Redis** |
+| Latency | **1.9 µs** | 1.19 ms | 2.60 ms | **630x vs Redis** |
 
 ### Read (10K bitmap)
 
@@ -119,7 +120,7 @@ Compared on the same machine, localhost. Redis 7.x, [bitmapist-server](https://g
 
 | | inoxset | Redis (BITOP AND) | bitmapist-server | Factor |
 |---|---|---|---|---|
-| Latency | **784 ns** | 87 µs | 21 µs | **111x vs Redis, 27x vs bitmapist** |
+| Latency | **802 ns** | 87 µs | 21 µs | **108x vs Redis, 26x vs bitmapist** |
 
 Bitmap cache eliminates deserialization: bitmaps are pre-loaded into RAM at flush time and served via `Arc<RoaringBitmap>`. The intersection itself (Roaring AND) takes ~300ns; the rest is two HashMap lookups + Arc clone.
 
@@ -219,7 +220,8 @@ The standard benchmark scenario uses:
 | Phase 0 | ArcSwap ReadIndex (cache catalog) | 7.0 ms | 30 µs | `9e22d08` |
 | Inverted Index | Bloom L1 + Roaring L2 + flat array | **29 µs** | 30 µs | `0a0fade` |
 | Bitmap Cache | Pre-deserialized bitmaps in ReadIndex | **29 µs** | **784 ns** | `5377766` |
-| **Global Dict** | One u32 per entity, 26x less disk, bitmap cache reads at 242ns | **27 µs** | **794 ns** | `40c523c` |
+| Global Dict | One u32 per entity, 26x less disk, bitmap cache reads at 242ns | **27 µs** | **794 ns** | `40c523c` |
+| **LMDB (heed)** | Replace redb with LMDB. 1.3x less disk, 2x faster dict writes | **25.6 µs** | **802 ns** | `8c06587` |
 
 ### What didn't work
 

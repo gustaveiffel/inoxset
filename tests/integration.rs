@@ -719,8 +719,6 @@ fn inverted_index_compaction_preserves() {
     assert_eq!(store.find_memberships("alice").unwrap().len(), 1);
     assert_eq!(store.find_memberships("bob").unwrap().len(), 1);
 }
-<<<<<<< HEAD
-=======
 
 // --- Cross-Event Intersection (global dict) ---
 
@@ -755,4 +753,3 @@ fn cross_event_intersection_correct_with_global_dict() {
         "global dict: intersection should contain exactly alice"
     );
 }
->>>>>>> f41c550 (fix: cross-event intersection now correct with global dictionary)

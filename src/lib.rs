@@ -1,7 +1,60 @@
-// inoxset — Roaring Bitmap storage engine with time-aware set algebra
-//
-// Library-first sync API. No async, no server.
-// Embed via spawn_blocking in async runtimes.
+//! # inoxset
+//!
+//! Roaring Bitmap storage engine with time-aware set algebra.
+//!
+//! `inoxset` is a **library-first, synchronous** embedded store for
+//! bitmap-based audience segments, cohorts, and membership sets. It has no
+//! server, no network surface, and no async runtime requirement.
+//!
+//! ## Quick start
+//!
+//! ```no_run
+//! use inoxset::{InoxSet, types::{Granularity, Rollup, Period}};
+//!
+//! let store = InoxSet::builder()
+//!     .path("./data")
+//!     .default_granularity(Granularity::Day)
+//!     .open()?;
+//!
+//! store.register_event("active", Granularity::Day, Rollup::Auto)?;
+//! store.put_ids("active", Period::Day(2026, 5, 20), &["user-1", "user-2"])?;
+//!
+//! let segments = store.find_memberships("user-1")?;
+//! # Ok::<(), inoxset::error::InoxSetError>(())
+//! ```
+//!
+//! ## Async runtimes (tokio, async-std)
+//!
+//! All public methods are synchronous and may block on I/O (LMDB, mmap, file
+//! reads). To call inoxset from an async context, wrap calls in the runtime's
+//! blocking-pool API:
+//!
+//! ```ignore
+//! use std::sync::Arc;
+//! use inoxset::InoxSet;
+//!
+//! async fn lookup(store: Arc<InoxSet>, id: String)
+//!     -> Result<Vec<(String, inoxset::types::Period)>, Box<dyn std::error::Error + Send + Sync>>
+//! {
+//!     let memberships = tokio::task::spawn_blocking(move || {
+//!         store.find_memberships(&id)
+//!     }).await??;
+//!     Ok(memberships)
+//! }
+//! ```
+//!
+//! `InoxSet` is `Send + Sync`; clone the `Arc` into every worker. Reads use
+//! lock-free paths (`ArcSwap`) and never block each other. Writes (`put_*`,
+//! `flush`, `compact`) take a write lock on the in-memory buffer but do not
+//! block readers on the bitmap cache.
+//!
+//! For sub-microsecond cache-hot lookups (`contains_id`, `get_shared`), the
+//! `spawn_blocking` overhead can dominate — measure before assuming.
+//!
+//! ## Stability
+//!
+//! This is a `0.1.x-alpha` release: the public API may change between minor
+//! versions. See `README.md` § Stability for the semver policy.
 
 pub(crate) mod bloom;
 pub mod builder;
@@ -19,6 +72,10 @@ pub(crate) mod read_index;
 pub mod rollup;
 pub mod types;
 
+// Top-level re-exports — the documented public API surface.
+pub use error::InoxSetError;
+pub use types::{Granularity, IndexFreshness, Period, Rollup, SetExpr};
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -31,12 +88,10 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
-use crate::error::{validate_event_name, InoxSetError};
+use crate::error::validate_event_name;
 use crate::mempart::MemPartSnapshot;
 use crate::period::catalog_key;
-use crate::types::{
-    CompactStats, EventConfig, Granularity, Health, Part, PartKind, Period, PeriodState, Rollup,
-};
+use crate::types::{CompactStats, EventConfig, Health, Part, PartKind, PeriodState};
 
 /// Storage for the inverted index — varies by freshness mode.
 pub(crate) enum InvertedStore {

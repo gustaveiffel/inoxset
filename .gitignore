@@ -4,3 +4,6 @@
 
 # OS files
 .DS_Store
+
+# Claude Code local config (contains absolute paths and local permissions)
+.claude/

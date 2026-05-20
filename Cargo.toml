@@ -5,6 +5,26 @@ edition = "2021"
 description = "Embeddable set engine — power segmentation, analytics, and AI recall in real time"
 license = "MIT"
 rust-version = "1.75"
+authors = ["Augustin Amann"]
+repository = "https://github.com/gustaveiffel/inoxset"
+homepage = "https://github.com/gustaveiffel/inoxset"
+documentation = "https://docs.rs/inoxset"
+readme = "README.md"
+keywords = ["bitmap", "roaring", "analytics", "segmentation", "cohort"]
+categories = ["database-implementations", "data-structures"]
+
+# Allowlist for `cargo publish` — restricts the uploaded tarball to public,
+# user-facing artifacts. Internal docs / planning / local config never ship.
+include = [
+    "src/**/*.rs",
+    "benches/benchmarks.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "PERFORMANCE.md",
+    "LICENSE-MIT",
+]
 
 [features]
 default = []

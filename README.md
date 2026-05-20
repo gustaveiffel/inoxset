@@ -330,7 +330,27 @@ inoxset builds on ideas from several systems. We are grateful to their authors a
 
 ## Status
 
-Alpha. 233 tests (unit, integration, property-based). API is functional but may change before 1.0. Not yet battle-tested in production.
+Alpha. 233 tests (unit, integration, property-based). API is functional but
+may change between minor versions until `0.2.0`. Not yet battle-tested in
+production.
+
+## Stability & semver policy
+
+`inoxset` follows the [Cargo semver convention](https://doc.rust-lang.org/cargo/reference/semver.html)
+adapted to the pre-1.0 reality:
+
+| Version range       | Promise                                                                    |
+| ------------------- | -------------------------------------------------------------------------- |
+| `0.1.0-alphaN`      | No stability guarantee. Breaking changes can land on any alpha bump.       |
+| `0.1.x` (post-alpha)| Patch releases are non-breaking. Minor (`0.2.0`) is the first semver line. |
+| `0.2.x → 0.y.x`     | Breaking changes only on minor (`0.y → 0.y+1`); patches are safe.          |
+| `1.0.0+`            | Full semver: breaking changes only on major.                               |
+
+The current line is `0.1.0-alpha.4`. We recommend pinning to an exact version
+(`inoxset = "=0.1.0-alpha.4"`) until `0.2.0` ships.
+
+**MSRV**: Rust `1.75`. Bumps to MSRV are treated as breaking and gated on a
+minor version bump once we leave alpha.
 
 ## License
 

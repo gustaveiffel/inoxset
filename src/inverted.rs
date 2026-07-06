@@ -165,6 +165,27 @@ impl InvertedIndexBuilder {
         ));
     }
 
+    /// Stages a row with caller-supplied hashes, bypassing [`fx_hash64`].
+    ///
+    /// Lets tests inject FxHash64 collisions, which cannot be produced from
+    /// real strings in reasonable time.
+    #[cfg(test)]
+    pub(crate) fn add_raw(
+        &mut self,
+        h64: u64,
+        external_id: &str,
+        event_id: u16,
+        period_id: u16,
+    ) {
+        self.raw.push((
+            h64,
+            h64 as u32,
+            external_id.as_bytes().to_vec(),
+            event_id,
+            period_id,
+        ));
+    }
+
     /// Consumes the builder and produces a frozen [`InvertedIndex`].
     ///
     /// Rows are sorted by `h64`; entries with the same `h64` are grouped into a
@@ -197,17 +218,20 @@ impl InvertedIndexBuilder {
         while i < self.raw.len() {
             let h64 = self.raw[i].0;
             let h32 = self.raw[i].1;
-            let ext_bytes = &self.raw[i].2;
 
-            // Insert into pre-filters using the raw bytes of the first row with this h64.
-            bloom.insert(ext_bytes);
+            // h32 is the lower 32 bits of h64, so it is identical for every
+            // row in this group; one insert covers them all.
             known_hashes.insert(h32);
 
             let offset = memberships.len() as u32;
             let mut count = 0u32;
 
-            // Group all rows sharing this h64.
+            // Group all rows sharing this h64. The Bloom filter is keyed on
+            // raw ID bytes, which can differ across rows of the same h64
+            // group (FxHash64 collision) — insert every row's bytes so no
+            // colliding ID becomes a false negative in `maybe_contains`.
             while i < self.raw.len() && self.raw[i].0 == h64 {
+                bloom.insert(&self.raw[i].2);
                 let (_, _, _, event_id, period_id) = self.raw[i];
                 memberships.push(Membership::inline(event_id, period_id));
                 count += 1;
@@ -290,5 +314,21 @@ mod tests {
         assert!(idx.contains("alice", "clicks", &Period::Day(2026, 4, 1)));
         assert!(!idx.contains("alice", "clicks", &Period::Day(2026, 4, 3)));
         assert!(!idx.contains("unknown", "clicks", &Period::Day(2026, 4, 1)));
+    }
+
+    #[test]
+    fn bloom_covers_all_ids_in_h64_collision_group() {
+        // Two distinct external IDs forced onto the same h64: both must be
+        // inserted into the Bloom filter, otherwise whichever ID sorts second
+        // in the group becomes a permanent false negative in maybe_contains.
+        let event_names = vec!["clicks".to_string()];
+        let periods = vec![Period::Day(2026, 4, 1)];
+        let mut builder = InvertedIndexBuilder::new(event_names, periods);
+        builder.add_raw(0xDEAD_BEEF, "collider_a", 0, 0);
+        builder.add_raw(0xDEAD_BEEF, "collider_b", 0, 0);
+        let idx = builder.build();
+
+        assert!(idx.maybe_contains("collider_a"));
+        assert!(idx.maybe_contains("collider_b"));
     }
 }

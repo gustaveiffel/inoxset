@@ -534,17 +534,14 @@ fn corrupt_part_file_returns_error() {
         "cached get() should succeed despite corrupt file"
     );
 
-    // On reopen, the corrupt file is detected during cache build.
-    // The store still opens (corrupt parts are skipped with empty bitmap).
+    // On reopen, the corrupt file is detected during cache build and open
+    // fails loudly. Silently skipping the part would serve an empty bitmap
+    // for a period that has data — undetectable data loss.
     drop(s);
-    let s2 = InoxSet::builder()
-        .path(dir.path().join("data"))
-        .open()
-        .unwrap();
-    let result = s2.get("x", Period::Day(2026, 3, 11)).unwrap();
+    let result = InoxSet::builder().path(dir.path().join("data")).open();
     assert!(
-        result.is_empty(),
-        "corrupt part should produce empty bitmap on reopen"
+        result.is_err(),
+        "reopen must surface the corrupt part instead of serving empty data"
     );
 }
 
@@ -752,4 +749,184 @@ fn cross_event_intersection_correct_with_global_dict() {
         1,
         "global dict: intersection should contain exactly alice"
     );
+}
+
+// --- Re-insert after remove (temporal delta semantics) ---
+
+fn bm_of(ids: &[u32]) -> RoaringBitmap {
+    let mut bm = RoaringBitmap::new();
+    for &id in ids {
+        bm.insert(id);
+    }
+    bm
+}
+
+#[test]
+fn readd_after_remove_in_same_mempart() {
+    // put → remove → put without any flush: the re-inserted bit must survive.
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let p = Period::Day(2026, 3, 11);
+
+    s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+    s.remove_bits("ev", p, &[42]).unwrap();
+    s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+
+    let got = s.get("ev", p).unwrap();
+    assert!(got.contains(42), "re-inserted bit lost in mempart window");
+}
+
+#[test]
+fn remove_after_readd_still_removes() {
+    // put → remove → put → remove: the last remove wins.
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let p = Period::Day(2026, 3, 11);
+
+    s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+    s.remove_bits("ev", p, &[42]).unwrap();
+    s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+    s.remove_bits("ev", p, &[42]).unwrap();
+
+    let got = s.get("ev", p).unwrap();
+    assert!(!got.contains(42), "final remove must win");
+}
+
+#[test]
+fn readd_after_remove_across_flushes() {
+    // Three separate flushes: data{42} / delta{42} / data{42}.
+    // The delta must only erase the first put, not the re-insert.
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let p = Period::Day(2026, 3, 11);
+
+    s.put_bitmap("ev", p, bm_of(&[42, 7])).unwrap();
+    s.flush().unwrap();
+    s.remove_bits("ev", p, &[42]).unwrap();
+    s.flush().unwrap();
+    s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+
+    // Before the final flush (mempart put over disk delta).
+    let got = s.get("ev", p).unwrap();
+    assert!(got.contains(42), "unflushed re-insert erased by disk delta");
+    assert!(got.contains(7));
+
+    // After the final flush (three parts on disk).
+    s.flush().unwrap();
+    let got = s.get("ev", p).unwrap();
+    assert!(got.contains(42), "flushed re-insert erased by older delta");
+    assert!(s.contains_batch("ev", p, &[42]).unwrap()[0]);
+
+    // And after compaction.
+    s.compact().unwrap();
+    let got = s.get("ev", p).unwrap();
+    assert!(got.contains(42), "compaction erased re-inserted bit");
+    assert!(got.contains(7));
+    assert_eq!(got.len(), 2);
+}
+
+#[test]
+fn readd_after_remove_survives_reopen() {
+    // The part-id ordering must also hold when the read index is rebuilt
+    // from the catalog on reopen.
+    let dir = TempDir::new().unwrap();
+    let p = Period::Day(2026, 3, 11);
+    {
+        let s = store(&dir);
+        s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+        s.flush().unwrap();
+        s.remove_bits("ev", p, &[42]).unwrap();
+        s.flush().unwrap();
+        s.put_bitmap("ev", p, bm_of(&[42])).unwrap();
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let s = store(&dir);
+    let got = s.get("ev", p).unwrap();
+    assert!(got.contains(42), "re-inserted bit lost after reopen");
+}
+
+#[test]
+fn readd_after_remove_with_rollup() {
+    // Remove propagates deltas to Day/Month/Year; a later put at another
+    // hour of the same day must re-establish the bit at every ancestor.
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+
+    s.put_bitmap("ev", Period::Hour(2026, 3, 11, 10), bm_of(&[42]))
+        .unwrap();
+    s.remove_bits("ev", Period::Hour(2026, 3, 11, 10), &[42])
+        .unwrap();
+    s.put_bitmap("ev", Period::Hour(2026, 3, 11, 14), bm_of(&[42]))
+        .unwrap();
+
+    // Hour 10 was removed and never re-put: still gone.
+    assert!(!s
+        .get("ev", Period::Hour(2026, 3, 11, 10))
+        .unwrap()
+        .contains(42));
+    // Hour 14 and all rollup ancestors must contain the bit again.
+    assert!(s
+        .get("ev", Period::Hour(2026, 3, 11, 14))
+        .unwrap()
+        .contains(42));
+    assert!(s.get("ev", Period::Day(2026, 3, 11)).unwrap().contains(42));
+    assert!(s.get("ev", Period::Month(2026, 3)).unwrap().contains(42));
+    assert!(s.get("ev", Period::Year(2026)).unwrap().contains(42));
+}
+
+#[test]
+fn unflushed_remove_hides_membership_in_find_memberships() {
+    // find_memberships must reflect unflushed removes, matching get().
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let p = Period::Day(2026, 3, 11);
+
+    s.put_ids("ev", p, &["alice"]).unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.find_memberships("alice").unwrap().len(), 1);
+
+    s.remove_ids("ev", p, &["alice"]).unwrap();
+    assert!(
+        s.find_memberships("alice").unwrap().is_empty(),
+        "unflushed remove must hide the membership"
+    );
+}
+
+// --- get_range bounds hardening ---
+
+#[test]
+fn get_range_reversed_bounds_returns_empty() {
+    // start > end must return empty instead of looping unboundedly.
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    s.put_bitmap("ev", Period::Day(2026, 3, 11), bm_of(&[1]))
+        .unwrap();
+
+    let got = s
+        .get_range("ev", Period::Day(2026, 3, 12), Period::Day(2026, 3, 10))
+        .unwrap();
+    assert!(got.is_empty());
+}
+
+#[test]
+fn get_range_invalid_bound_is_rejected() {
+    // An unreachable end bound (Feb 30) must error instead of iterating
+    // past it forever.
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let result = s.get_range("ev", Period::Day(2026, 2, 1), Period::Day(2026, 2, 30));
+    assert!(result.is_err());
+}
+
+#[test]
+fn put_bitmap_rejects_invalid_period() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    assert!(s
+        .put_bitmap("ev", Period::Day(2026, 13, 40), bm_of(&[1]))
+        .is_err());
+    assert!(s
+        .put_bitmap("ev", Period::Day(2026, 2, 29), bm_of(&[1]))
+        .is_err()); // 2026 is not a leap year
 }

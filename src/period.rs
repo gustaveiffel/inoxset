@@ -65,6 +65,58 @@ impl Period {
         }
     }
 
+    /// Validates that all calendar components are in range.
+    ///
+    /// Checks month ∈ 1..=12, day ∈ 1..=days-in-month (leap-year aware), and
+    /// hour ∈ 0..=23. [`Period::Static`] and [`Period::Year`] are always
+    /// valid.
+    ///
+    /// Write paths call this before accepting a period: an out-of-range
+    /// period would produce a catalog key that [`parse_period_key`] rejects
+    /// on reload, making the data silently invisible to index-based reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::InvalidPeriod`](crate::error::InoxSetError::InvalidPeriod)
+    /// naming the out-of-range component.
+    pub fn validate(&self) -> crate::Result<()> {
+        let err = |reason: String| crate::error::InoxSetError::InvalidPeriod {
+            period: *self,
+            reason,
+        };
+        let check_month = |m: u8| {
+            if (1..=12).contains(&m) {
+                Ok(())
+            } else {
+                Err(err(format!("month {m} out of range 1..=12")))
+            }
+        };
+        let check_day = |y: u16, m: u8, d: u8| {
+            let dim = days_in_month(y as i32, m as u32) as u8;
+            if (1..=dim).contains(&d) {
+                Ok(())
+            } else {
+                Err(err(format!("day {d} out of range 1..={dim} for {y:04}-{m:02}")))
+            }
+        };
+        match *self {
+            Period::Static | Period::Year(_) => Ok(()),
+            Period::Month(_, m) => check_month(m),
+            Period::Day(y, m, d) => {
+                check_month(m)?;
+                check_day(y, m, d)
+            }
+            Period::Hour(y, m, d, h) => {
+                check_month(m)?;
+                check_day(y, m, d)?;
+                if h > 23 {
+                    return Err(err(format!("hour {h} out of range 0..=23")));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Returns `true` if this period's time window has fully elapsed relative
     /// to `now_unix` (seconds since the Unix epoch).
     ///
@@ -215,10 +267,16 @@ pub(crate) fn days_in_month(y: i32, m: u32) -> u32 {
 
 /// Converts calendar components to a Unix timestamp (seconds since 1970-01-01
 /// UTC). Handles overflow in `h`, `d`, and `m` through normalization.
+///
+/// Pre-epoch dates saturate to 0: a `u64` cannot represent them, and every
+/// pre-1970 period boundary is in the past anyway (`is_closed` → true).
 fn datetime_to_unix(y: i32, m: i32, d: i32, h: i32) -> u64 {
     let (y, m, d, h) = normalize(y, m, d, h);
     let days = days_from_civil(y, m as u32, d as u32);
-    (days as u64).wrapping_mul(86400) + h as u64 * 3600
+    if days < 0 {
+        return 0;
+    }
+    (days as u64).saturating_mul(86400) + h as u64 * 3600
 }
 
 /// Normalizes potentially out-of-range hour, day, and month components into
@@ -407,5 +465,38 @@ mod tests {
         assert_eq!(super::parse_period_key("2026-13"), None); // bad month
         assert_eq!(super::parse_period_key("2026-03-32"), None); // bad day
         assert_eq!(super::parse_period_key("2026-03-11T25"), None); // bad hour
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_periods() {
+        assert!(Period::Static.validate().is_ok());
+        assert!(Period::Year(2026).validate().is_ok());
+        assert!(Period::Month(2026, 12).validate().is_ok());
+        assert!(Period::Day(2026, 2, 28).validate().is_ok());
+        assert!(Period::Day(2024, 2, 29).validate().is_ok()); // leap year
+        assert!(Period::Hour(2026, 3, 11, 0).validate().is_ok());
+        assert!(Period::Hour(2026, 3, 11, 23).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_components() {
+        assert!(Period::Month(2026, 0).validate().is_err());
+        assert!(Period::Month(2026, 13).validate().is_err());
+        assert!(Period::Day(2026, 3, 0).validate().is_err());
+        assert!(Period::Day(2026, 3, 32).validate().is_err());
+        assert!(Period::Day(2026, 2, 29).validate().is_err()); // not a leap year
+        assert!(Period::Day(2026, 4, 31).validate().is_err()); // April has 30
+        assert!(Period::Hour(2026, 3, 11, 24).validate().is_err());
+        assert!(Period::Hour(2026, 13, 11, 0).validate().is_err());
+    }
+
+    #[test]
+    fn is_closed_pre_epoch_periods() {
+        // Pre-1970 periods must report closed instead of wrapping to a huge
+        // future boundary.
+        let now_2026 = 1_773_500_000;
+        assert!(Period::Year(1900).is_closed(now_2026));
+        assert!(Period::Day(1969, 12, 31).is_closed(now_2026));
+        assert!(Period::Hour(1950, 6, 15, 12).is_closed(now_2026));
     }
 }

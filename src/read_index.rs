@@ -19,9 +19,11 @@ use crate::part_store;
 use crate::period::parse_period_key;
 use crate::types::Period;
 
-/// Cached part location — file path for a single part.
+/// Cached part location — id and file path for a single part.
 #[derive(Debug, Clone)]
 pub(crate) struct PartLoc {
+    /// Monotonic part id — encodes write order for delta application.
+    pub part_id: u64,
     pub file_path: PathBuf,
 }
 
@@ -82,6 +84,7 @@ impl ReadIndex {
                 for pid in data_ids {
                     if let Some(part) = catalog.get_part(pid)? {
                         entry.data_parts.push(PartLoc {
+                            part_id: pid,
                             file_path: part.file_path,
                         });
                     }
@@ -92,6 +95,7 @@ impl ReadIndex {
                 for pid in delta_ids {
                     if let Some(part) = catalog.get_part(pid)? {
                         entry.delta_parts.push(PartLoc {
+                            part_id: pid,
                             file_path: part.file_path,
                         });
                     }
@@ -101,24 +105,33 @@ impl ReadIndex {
             }
         }
 
-        // Build bitmap cache: merge all data parts per (event, period),
-        // apply delta parts, and store the result as Arc<RoaringBitmap>.
+        // Build bitmap cache: fold data and delta parts per (event, period)
+        // in ascending part-id order (data ORs in, delta subtracts), and
+        // store the result as Arc<RoaringBitmap>. Part ids encode write
+        // order, so a delta only erases bits from data flushed before it.
+        // Read errors propagate: a corrupt or unreadable part must fail the
+        // rebuild loudly instead of silently serving an incomplete bitmap
+        // for the lifetime of this index.
         let mut bitmap_cache: HashMap<(String, Period), Arc<RoaringBitmap>> = HashMap::new();
         for ((ev, period), entry) in &periods {
-            let mut merged = RoaringBitmap::new();
+            let mut ordered: Vec<(u64, bool, &PathBuf)> =
+                Vec::with_capacity(entry.data_parts.len() + entry.delta_parts.len());
             for loc in &entry.data_parts {
-                if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
+                ordered.push((loc.part_id, false, &loc.file_path));
+            }
+            for loc in &entry.delta_parts {
+                ordered.push((loc.part_id, true, &loc.file_path));
+            }
+            ordered.sort_unstable_by_key(|(id, _, _)| *id);
+
+            let mut merged = RoaringBitmap::new();
+            for (_, is_delta, path) in ordered {
+                let bm = part_store::mmap_read_part(path)?;
+                if is_delta {
+                    merged -= bm;
+                } else {
                     merged |= bm;
                 }
-            }
-            let mut deltas = RoaringBitmap::new();
-            for loc in &entry.delta_parts {
-                if let Ok(bm) = part_store::mmap_read_part(&loc.file_path) {
-                    deltas |= bm;
-                }
-            }
-            if !deltas.is_empty() {
-                merged -= deltas;
             }
             bitmap_cache.insert((ev.clone(), *period), Arc::new(merged));
         }

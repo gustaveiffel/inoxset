@@ -109,6 +109,32 @@ pub fn apply_rollup_delta(
     }
 }
 
+/// Clears `bitmap`'s bits from the pending delete-delta of every coarser
+/// ancestor period in `config.rollup_chain`.
+///
+/// This is the put-path counterpart to [`apply_rollup_delta`]: a put at a
+/// fine granularity re-establishes the bits at every rollup ancestor, so any
+/// pending remove of those bits at the ancestors is superseded and must be
+/// cancelled. The source `period` is the caller's responsibility, mirroring
+/// [`apply_rollup`].
+///
+/// This function is a no-op when `config.rollup != Rollup::Auto`.
+pub fn clear_rollup_delta(
+    mempart: &mut MemPart,
+    config: &EventConfig,
+    period: &Period,
+    bitmap: &RoaringBitmap,
+) {
+    if config.rollup != Rollup::Auto {
+        return;
+    }
+    for ancestor in period.ancestors() {
+        if config.rollup_chain.contains(&ancestor.granularity()) {
+            mempart.clear_delta_bits(&config.name, &ancestor, bitmap);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,6 +58,16 @@ pub enum InoxSetError {
     #[error("invalid event name: {0} (allowed: [a-zA-Z0-9_:.\\-])")]
     InvalidEventName(String),
 
+    /// The [`Period`] has out-of-range calendar components (month, day, or
+    /// hour), e.g. `Period::Day(2026, 13, 40)`.
+    #[error("invalid period {period:?}: {reason}")]
+    InvalidPeriod {
+        /// The malformed period as supplied by the caller.
+        period: Period,
+        /// Which component is out of range.
+        reason: String,
+    },
+
     /// An attempt was made to register an event name that is already present
     /// in the catalog.
     #[error("event already registered: {0}")]

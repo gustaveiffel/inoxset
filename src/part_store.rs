@@ -139,6 +139,22 @@ pub fn write_part(path: &Path, bitmap: &RoaringBitmap) -> Result<()> {
         source: e,
     })?;
 
+    // Make the rename itself durable: fsync the parent directory so the new
+    // directory entry survives a crash. Without this, the catalog (which
+    // commits durably after this call) could reference a file that vanished
+    // with the unsynced directory entry.
+    #[cfg(unix)]
+    {
+        let dir = fs::File::open(parent).map_err(|e| InoxSetError::BitmapIo {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+        dir.sync_all().map_err(|e| InoxSetError::BitmapIo {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
     Ok(())
 }
 
@@ -405,18 +421,11 @@ pub fn serialized_contains(data: &[u8], value: u32) -> bool {
 /// Checks membership of a `u32` value in a part file without deserializing
 /// the bitmap.
 ///
-/// Memory-maps the file and calls [`serialized_contains`] directly on the
-/// mapped bytes. This is ~100x faster than [`mmap_read_part`] followed by
-/// `bitmap.contains()` for single-value lookups.
-///
-/// # Errors
-///
-/// Returns [`InoxSetError::BitmapIo`] if the file cannot be opened or mapped.
-/// Checks membership of a `u32` value in a part file without deserializing
-/// the bitmap.
-///
-/// For files ≤ 64 KiB, reads into a stack-friendly buffer to avoid mmap
-/// syscall overhead. For larger files, uses memory-mapping.
+/// Calls [`serialized_contains`] directly on the file bytes. This is ~100x
+/// faster than [`mmap_read_part`] followed by `bitmap.contains()` for
+/// single-value lookups. For files ≤ 64 KiB, reads into a buffer to avoid
+/// mmap syscall overhead; larger files are memory-mapped so the OS page
+/// cache is shared across readers.
 ///
 /// # Errors
 ///

@@ -209,22 +209,17 @@ impl InoxSet {
         // in a single LMDB read transaction to avoid 6M+ individual txn opens.
         let mut pending: Vec<(u16, u16, u32)> = Vec::new();
 
-        for ((ev, period), entry) in &ridx.periods {
+        for (ev, period) in ridx.periods.keys() {
             let event_id = event_map[ev];
             let period_id = period_map[period];
 
-            // Merge data parts and subtract delta parts.
-            let mut bm = RoaringBitmap::new();
-            for loc in &entry.data_parts {
-                if let Ok(part_bm) = part_store::mmap_read_part(&loc.file_path) {
-                    bm |= part_bm;
-                }
-            }
-            for loc in &entry.delta_parts {
-                if let Ok(delta_bm) = part_store::mmap_read_part(&loc.file_path) {
-                    bm -= delta_bm;
-                }
-            }
+            // The bitmap cache is built alongside `periods` from the same
+            // catalog snapshot, with parts folded in part-id order and read
+            // errors surfaced at build time — reuse it instead of re-reading
+            // (and re-merging) the part files here.
+            let Some(bm) = ridx.bitmap_cache.get(&(ev.clone(), *period)) else {
+                continue;
+            };
 
             for internal_id in bm.iter() {
                 pending.push((event_id, period_id, internal_id));
@@ -531,52 +526,22 @@ impl InoxSet {
             return Ok(Vec::new());
         }
 
-        // Phase 2: scan the in-memory index — zero LMDB lookups.
+        // Phase 2: scan the pre-merged bitmap cache — zero LMDB lookups, no
+        // file I/O. The cache already folds data and delta parts in part-id
+        // order, so per-part membership scanning (and its temporally-blind
+        // tombstone handling) is unnecessary.
         let mut memberships = Vec::new();
-        let mut file_cache: std::collections::HashMap<PathBuf, Vec<u8>> =
-            std::collections::HashMap::new();
 
         for (event_name, internal_id) in &event_ids {
-            for ((ev, period), entry) in &idx.periods {
-                if ev != event_name {
-                    continue;
+            for ((ev, period), bm) in &idx.bitmap_cache {
+                if ev == event_name && bm.contains(*internal_id) {
+                    memberships.push((event_name.clone(), *period));
                 }
-
-                // Check data parts via serialized_contains.
-                let mut found = false;
-                for loc in &entry.data_parts {
-                    let bytes = file_cache
-                        .entry(loc.file_path.clone())
-                        .or_insert_with(|| std::fs::read(&loc.file_path).unwrap_or_default());
-                    if part_store::serialized_contains(bytes, *internal_id) {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    continue;
-                }
-
-                // Check tombstones.
-                let mut tombstoned = false;
-                for loc in &entry.delta_parts {
-                    let bytes = file_cache
-                        .entry(loc.file_path.clone())
-                        .or_insert_with(|| std::fs::read(&loc.file_path).unwrap_or_default());
-                    if part_store::serialized_contains(bytes, *internal_id) {
-                        tombstoned = true;
-                        break;
-                    }
-                }
-                if tombstoned {
-                    continue;
-                }
-
-                memberships.push((event_name.clone(), *period));
             }
         }
 
-        // Phase 3: check mempart for unflushed data.
+        // Phase 3: overlay mempart state — add unflushed puts, then filter
+        // out memberships tombstoned by unflushed removes.
         {
             let mp = self.writer.read().map_err(|e| {
                 log::error!("RwLock poisoned: {e}");
@@ -598,6 +563,16 @@ impl InoxSet {
                     }
                 }
             }
+            // Unflushed removes must hide flushed memberships, mirroring the
+            // frozen-index path above and the read path in `get`.
+            for (event_name, internal_id) in &event_ids {
+                memberships.retain(|(ev, period)| {
+                    ev != event_name
+                        || !mp
+                            .get_delta(ev, period)
+                            .is_some_and(|d| d.contains(*internal_id))
+                });
+            }
         }
 
         Ok(memberships)
@@ -608,9 +583,8 @@ impl InoxSet {
     /// **Note:** This API is unstable and will be significantly optimized in a
     /// future release (arena storage). The signature will remain the same.
     ///
-    /// Uses zero-copy membership checks on serialized roaring bytes via
-    /// [`part_store::mmap_contains`], avoiding full bitmap deserialization.
-    /// Falls back to in-memory check for unflushed data.
+    /// Flushed state is answered from the pre-merged bitmap cache (no file
+    /// I/O); unflushed puts and removes are overlaid from the mempart.
     ///
     /// # Errors
     ///
@@ -773,32 +747,19 @@ impl InoxSet {
             }
         }
 
-        // Check disk parts via read index (zero LMDB lookups).
+        // Check flushed state via the pre-merged bitmap cache (zero LMDB
+        // lookups, no file I/O). The cache folds data and delta parts in
+        // part-id order, so deltas only erase bits older than themselves.
         let idx = self.ridx.load();
         let key = (event.to_string(), period);
 
-        let entry = match idx.periods.get(&key) {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-
-        let mut found_on_disk = false;
-        for loc in &entry.data_parts {
-            if part_store::mmap_contains(&loc.file_path, value)? {
-                found_on_disk = true;
-                break;
-            }
-        }
+        let found_on_disk = idx
+            .bitmap_cache
+            .get(&key)
+            .is_some_and(|bm| bm.contains(value));
 
         if !found_on_disk {
             return Ok(false);
-        }
-
-        // Check disk deltas.
-        for loc in &entry.delta_parts {
-            if part_store::mmap_contains(&loc.file_path, value)? {
-                return Ok(false); // tombstoned
-            }
         }
 
         // Check mempart delta.
@@ -1061,6 +1022,7 @@ impl InoxSet {
     /// match the event's configured granularity.
     pub fn put_bitmap(&self, event: &str, period: Period, bitmap: RoaringBitmap) -> Result<()> {
         self.check_writable()?;
+        period.validate()?;
         let config = self.ensure_event(event)?;
 
         // Static periods always pass; for time-based, validate granularity.
@@ -1088,6 +1050,12 @@ impl InoxSet {
             })?;
             mp.or_bitmap(event, period, &bitmap);
             rollup::apply_rollup(&mut mp, &config, &period, &bitmap);
+            // A put supersedes any pending (unflushed) remove of the same
+            // bits, at the source period and every rollup ancestor. Without
+            // this, `put` after `remove_bits` in the same flush window would
+            // be silently erased by the stale delta.
+            mp.clear_delta_bits(event, &period, &bitmap);
+            rollup::clear_rollup_delta(&mut mp, &config, &period, &bitmap);
             should_flush = mp.size_bytes() >= self.flush_threshold;
         }
 
@@ -1404,10 +1372,19 @@ impl InoxSet {
         let delta_part_ids =
             Catalog::txn_get_period_deltas(&self.catalog.period_deltas, &txn, &cat_key)?;
 
-        // OR all data parts from disk.
+        // Fold disk parts in ascending part-id order (data ORs in, delta
+        // subtracts). Part ids encode write order, so a delta only erases
+        // bits from data parts flushed before it — bits re-inserted by a
+        // later put survive.
+        let mut ordered: Vec<(u64, bool)> =
+            Vec::with_capacity(data_part_ids.len() + delta_part_ids.len());
+        ordered.extend(data_part_ids.iter().map(|&pid| (pid, false)));
+        ordered.extend(delta_part_ids.iter().map(|&pid| (pid, true)));
+        ordered.sort_unstable_by_key(|(id, _)| *id);
+
         let mut result = RoaringBitmap::new();
-        for pid in &data_part_ids {
-            if let Some(part) = Catalog::txn_get_part(&self.catalog.parts, &txn, *pid)? {
+        for (pid, is_delta) in ordered {
+            if let Some(part) = Catalog::txn_get_part(&self.catalog.parts, &txn, pid)? {
                 let bm = part_store::mmap_read_part(&part.file_path).map_err(|e| match e {
                     InoxSetError::BitmapCorrupted { .. } => InoxSetError::BitmapCorrupted {
                         event: event.to_string(),
@@ -1415,38 +1392,23 @@ impl InoxSet {
                     },
                     other => other,
                 })?;
-                result |= bm;
+                if is_delta {
+                    result -= bm;
+                } else {
+                    result |= bm;
+                }
             }
         }
 
-        // OR mempart bitmap.
+        // Mempart data is newer than everything on disk: OR it in after the
+        // disk fold so no stale disk delta can erase unflushed puts.
         if let Some(mp_bm) = mp_bitmap {
             result |= mp_bm.as_ref();
         }
 
-        // Collect disk deltas.
-        let mut all_deltas = RoaringBitmap::new();
-        for pid in &delta_part_ids {
-            if let Some(part) = Catalog::txn_get_part(&self.catalog.parts, &txn, *pid)? {
-                let bm = part_store::mmap_read_part(&part.file_path).map_err(|e| match e {
-                    InoxSetError::BitmapCorrupted { .. } => InoxSetError::BitmapCorrupted {
-                        event: event.to_string(),
-                        period,
-                    },
-                    other => other,
-                })?;
-                all_deltas |= bm;
-            }
-        }
-
-        // OR mempart delta.
+        // Mempart delta is the newest state of all — subtract last.
         if let Some(mp_d) = mp_delta {
-            all_deltas |= mp_d.as_ref();
-        }
-
-        // AND-NOT deltas.
-        if !all_deltas.is_empty() {
-            result -= all_deltas;
+            result -= mp_d.as_ref();
         }
 
         self.metrics.bitmap_read(
@@ -1475,6 +1437,10 @@ impl InoxSet {
         end: Period,
     ) -> Result<Vec<(Period, RoaringBitmap)>> {
         self.check_closed()?;
+        // An out-of-range bound (e.g. Feb 30) can never be reached by period
+        // iteration, so it must be rejected before enumeration.
+        start.validate()?;
+        end.validate()?;
         let periods = Self::enumerate_periods(start, end);
         // Guard against unbounded ranges that would degrade into a DoS.
         const MAX_RANGE_PERIODS: usize = 366 * 24; // ~1 year of hours
@@ -1737,6 +1703,12 @@ impl InoxSet {
         if start == Period::Static || end == Period::Static {
             return vec![Period::Static];
         }
+        // A reversed range must return empty: `next_period` never yields
+        // `None` for time periods, so without this check the loop below
+        // would never reach `end` and grow unboundedly.
+        if start > end {
+            return vec![];
+        }
 
         let mut periods = Vec::new();
         let mut current = Some(start);
@@ -1810,6 +1782,7 @@ impl InoxSet {
     /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
     pub fn remove_bits(&self, event: &str, period: Period, user_ids: &[u32]) -> Result<()> {
         self.check_writable()?;
+        period.validate()?;
         let config = self.ensure_event(event)?;
 
         let mut delta = RoaringBitmap::new();
@@ -1842,6 +1815,7 @@ impl InoxSet {
     /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
     pub fn replace_bitmap(&self, event: &str, period: Period, bitmap: RoaringBitmap) -> Result<()> {
         self.check_writable()?;
+        period.validate()?;
         let config = self.ensure_event(event)?;
 
         // Clear mempart entries for this event/period.
@@ -1961,6 +1935,9 @@ impl InoxSet {
     /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
     pub fn bulk_replace(&self, event: &str, entries: &[(Period, RoaringBitmap)]) -> Result<()> {
         self.check_writable()?;
+        for (period, _) in entries {
+            period.validate()?;
+        }
         let config = self.ensure_event(event)?;
 
         // Collect old file paths for cleanup.
@@ -2149,26 +2126,27 @@ impl InoxSet {
             return Ok(());
         }
 
-        // Resolve paths and collect old file info.
-        let mut data_paths = Vec::new();
-        let mut delta_paths = Vec::new();
+        // Resolve (part_id, path) pairs and collect old file info. Part ids
+        // carry write order into the merge so deltas only erase older data.
+        let mut data_parts = Vec::new();
+        let mut delta_parts = Vec::new();
         let mut old_parts: Vec<Part> = Vec::new();
 
         for &pid in &data_ids {
             if let Some(part) = self.catalog.get_part(pid)? {
-                data_paths.push(part.file_path.clone());
+                data_parts.push((pid, part.file_path.clone()));
                 old_parts.push(part);
             }
         }
         for &pid in &delta_ids {
             if let Some(part) = self.catalog.get_part(pid)? {
-                delta_paths.push(part.file_path.clone());
+                delta_parts.push((pid, part.file_path.clone()));
                 old_parts.push(part);
             }
         }
 
         // Merge.
-        let merged = merge::merge_parts(&data_paths, &delta_paths)?;
+        let merged = merge::merge_parts(&data_parts, &delta_parts)?;
 
         // Determine event/period from the first old part.
         let representative = old_parts

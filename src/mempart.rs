@@ -105,6 +105,34 @@ impl MemPart {
             .wrapping_sub(old_size as u64);
     }
 
+    /// Removes `bitmap`'s bits from the delete-delta entry for `(event, period)`.
+    ///
+    /// Called by `put_bitmap`: a put supersedes any earlier pending remove of
+    /// the same bits, so those bits must not survive in the delta or the
+    /// re-inserted data would be subtracted again at read/flush time. Drops
+    /// the delta entry entirely when it becomes empty so no empty delta part
+    /// is flushed.
+    pub fn clear_delta_bits(&mut self, event: &str, period: &Period, bitmap: &RoaringBitmap) {
+        let key = (event.to_string(), *period);
+        let Some(entry) = self.deltas.get_mut(&key) else {
+            return;
+        };
+        let existing = Arc::make_mut(entry);
+        let old_size = existing.serialized_size();
+        *existing -= bitmap;
+        let new_size = existing.serialized_size();
+        // Size accounting mirrors or_delta: only the delta relative to the
+        // empty-bitmap baseline is tracked, so dropping an empty entry needs
+        // no further adjustment (contributions telescope back to zero).
+        self.size_bytes = self
+            .size_bytes
+            .wrapping_add(new_size as u64)
+            .wrapping_sub(old_size as u64);
+        if existing.is_empty() {
+            self.deltas.remove(&key);
+        }
+    }
+
     /// Returns an `Arc`-clone of the additive bitmap for `(event, period)`, or
     /// `None` if no data has been written for that key.
     ///
@@ -257,6 +285,42 @@ mod tests {
     #[test]
     fn default_is_empty() {
         let mp = MemPart::default();
+        assert!(mp.is_empty());
+        assert_eq!(mp.size_bytes(), 0);
+    }
+
+    #[test]
+    fn clear_delta_bits_removes_and_drops_empty_entry() {
+        let mut mp = MemPart::new();
+        let mut delta = RoaringBitmap::new();
+        delta.insert(42);
+        delta.insert(99);
+        mp.or_delta("ev", Period::Static, &delta);
+
+        // Clearing a subset keeps the entry with the remaining bits.
+        let mut put = RoaringBitmap::new();
+        put.insert(42);
+        mp.clear_delta_bits("ev", &Period::Static, &put);
+        let d = mp.get_delta("ev", &Period::Static).unwrap();
+        assert!(!d.contains(42));
+        assert!(d.contains(99));
+
+        // Clearing the rest drops the entry entirely and the size counter
+        // telescopes back to zero (no wrapping underflow).
+        let mut put2 = RoaringBitmap::new();
+        put2.insert(99);
+        mp.clear_delta_bits("ev", &Period::Static, &put2);
+        assert!(mp.get_delta("ev", &Period::Static).is_none());
+        assert!(mp.is_empty());
+        assert_eq!(mp.size_bytes(), 0, "size must not underflow");
+    }
+
+    #[test]
+    fn clear_delta_bits_missing_entry_is_noop() {
+        let mut mp = MemPart::new();
+        let mut put = RoaringBitmap::new();
+        put.insert(1);
+        mp.clear_delta_bits("nope", &Period::Static, &put);
         assert!(mp.is_empty());
         assert_eq!(mp.size_bytes(), 0);
     }

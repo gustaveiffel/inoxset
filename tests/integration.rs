@@ -930,3 +930,132 @@ fn put_bitmap_rejects_invalid_period() {
         .put_bitmap("ev", Period::Day(2026, 2, 29), bm_of(&[1]))
         .is_err()); // 2026 is not a leap year
 }
+
+// --- Inverted index lifecycle (public issues #13, #14) ---
+
+fn store_with_index(dir: &TempDir) -> InoxSet {
+    InoxSet::builder()
+        .path(dir.path().join("data"))
+        .default_granularity(Granularity::Day)
+        .default_rollup(Rollup::None)
+        .index_freshness(inoxset::IndexFreshness::OnFlush)
+        .open()
+        .unwrap()
+}
+
+#[test]
+fn inverted_index_populated_on_reopen() {
+    // Issue #13: after reopen the index started empty and find_memberships
+    // silently returned no results until the first flush.
+    let dir = TempDir::new().unwrap();
+    let p = Period::Day(2026, 3, 11);
+    {
+        let s = store_with_index(&dir);
+        s.put_ids("ev_a", p, &["alice", "bob"]).unwrap();
+        s.put_ids("ev_b", p, &["alice"]).unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.find_memberships("alice").unwrap().len(), 2);
+        s.close().unwrap();
+    }
+
+    let s = store_with_index(&dir);
+    let memberships = s.find_memberships("alice").unwrap();
+    assert_eq!(
+        memberships.len(),
+        2,
+        "reopened store must serve find_memberships without a prior flush"
+    );
+    assert!(s.contains_id("ev_a", p, "alice").unwrap());
+    assert!(!s.contains_id("ev_a", p, "unknown").unwrap());
+}
+
+#[test]
+fn delete_entity_read_your_deletes_with_frozen_index() {
+    // Issue #14: between delete_entity and the next flush, contains_id kept
+    // returning true because the tombstone check resolved through the
+    // dictionary entry that delete_entity had just removed.
+    let dir = TempDir::new().unwrap();
+    let s = store_with_index(&dir);
+    let p = Period::Day(2026, 3, 11);
+
+    s.put_ids("ev_a", p, &["alice", "bob"]).unwrap();
+    s.put_ids("ev_b", p, &["alice"]).unwrap();
+    s.flush().unwrap();
+    assert!(s.contains_id("ev_a", p, "alice").unwrap());
+
+    let removed = s.delete_entity("alice").unwrap();
+    assert_eq!(removed, 2);
+
+    // Read-your-deletes: no read path may still affirm membership.
+    assert!(
+        !s.contains_id("ev_a", p, "alice").unwrap(),
+        "contains_id must be false immediately after delete_entity"
+    );
+    assert!(!s.contains_id("ev_b", p, "alice").unwrap());
+    assert!(s.find_memberships("alice").unwrap().is_empty());
+    // Unrelated entities are untouched.
+    assert!(s.contains_id("ev_a", p, "bob").unwrap());
+
+    // And still false once the tombstones are durable.
+    s.flush().unwrap();
+    s.compact().unwrap();
+    assert!(!s.contains_id("ev_a", p, "alice").unwrap());
+}
+
+// --- N-way cardinality (public issue #15) ---
+
+#[test]
+fn union_cardinality_many_folds_buckets() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+
+    s.put_bitmap("ev", Period::Day(2026, 3, 10), bm_of(&[1, 2]))
+        .unwrap();
+    s.put_bitmap("ev", Period::Day(2026, 3, 11), bm_of(&[2, 3]))
+        .unwrap();
+    s.put_bitmap("ev", Period::Day(2026, 3, 12), bm_of(&[3, 4]))
+        .unwrap();
+    s.flush().unwrap();
+
+    let keys = [
+        ("ev", Period::Day(2026, 3, 10)),
+        ("ev", Period::Day(2026, 3, 11)),
+        ("ev", Period::Day(2026, 3, 12)),
+    ];
+    assert_eq!(s.union_cardinality_many(&keys).unwrap(), 4); // {1,2,3,4}
+    assert_eq!(s.union_cardinality_many(&keys[..1]).unwrap(), 2);
+    assert_eq!(s.union_cardinality_many(&[]).unwrap(), 0);
+
+    // Consistent with the pairwise API.
+    assert_eq!(
+        s.union_cardinality_many(&keys[..2]).unwrap(),
+        s.union_cardinality("ev", Period::Day(2026, 3, 10), "ev", Period::Day(2026, 3, 11))
+            .unwrap()
+    );
+}
+
+#[test]
+fn intersect_cardinality_many_short_circuits() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+
+    s.put_bitmap("ev", Period::Day(2026, 3, 10), bm_of(&[1, 2, 3]))
+        .unwrap();
+    s.put_bitmap("ev", Period::Day(2026, 3, 11), bm_of(&[2, 3, 4]))
+        .unwrap();
+    s.put_bitmap("ev", Period::Day(2026, 3, 12), bm_of(&[3, 4, 5]))
+        .unwrap();
+    s.put_bitmap("ev", Period::Day(2026, 3, 13), bm_of(&[99]))
+        .unwrap();
+    s.flush().unwrap();
+
+    let d = |day| ("ev", Period::Day(2026, 3, day));
+    assert_eq!(s.intersect_cardinality_many(&[d(10), d(11), d(12)]).unwrap(), 1); // {3}
+    assert_eq!(s.intersect_cardinality_many(&[d(10)]).unwrap(), 3);
+    assert_eq!(s.intersect_cardinality_many(&[]).unwrap(), 0);
+    // Disjoint bucket empties the running intersection (short-circuit path).
+    assert_eq!(
+        s.intersect_cardinality_many(&[d(10), d(13), d(11), d(12)]).unwrap(),
+        0
+    );
+}

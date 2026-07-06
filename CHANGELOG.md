@@ -4,7 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`union_cardinality_many` / `intersect_cardinality_many`** (#15) — N-way cardinality over `(event, period)` keys with a single accumulator instead of N−1 pairwise intermediates; intersection short-circuits on empty.
+
 ### Fixed
+
+- **Inverted index is populated at store open** (#13). Previously a reopened store served an empty index until the first flush, so `find_memberships`/`contains_id` silently returned no results for entities that were present. Open latency grows with store size when the index is enabled; see `index_freshness` docs.
+- **`contains_id` honors `delete_entity` immediately** (#14). The staleness check resolved through the dictionary entry that `delete_entity` had just removed, so the frozen-index path kept answering `true` until flush+compact. Read-your-deletes now holds on every read path.
 
 - **Re-insert after remove no longer loses data.** Delta (tombstone) parts are now applied in part-id order — a delta only erases bits from data parts flushed *before* it, and `put_bitmap` cancels pending mempart deltas for the bits it writes (including rollup ancestors). Previously, `put → remove → put` silently dropped the re-inserted bits at read, flush, and compaction time.
 - **Inverted index Bloom filter false negatives on FxHash64 collision.** All external IDs in an h64 collision group are now inserted into the Bloom pre-filter; previously only the first one was, making the other IDs invisible to `find_memberships`/`contains_id`.

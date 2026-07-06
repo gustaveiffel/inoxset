@@ -167,6 +167,12 @@ impl InoxSetBuilder {
     /// The inverted index enables sub-microsecond reverse membership lookups
     /// via [`InoxSet::find_memberships`]. Defaults to [`IndexFreshness::Disabled`]
     /// (zero RAM overhead, falls back to bitmap scanning).
+    ///
+    /// When enabled, the index is built during [`open`](Self::open) so that
+    /// reverse lookups are correct immediately after a reopen. Open latency
+    /// grows with store size (hundreds of milliseconds on large stores);
+    /// use [`IndexFreshness::Disabled`] if open latency matters more than
+    /// reverse-lookup speed.
     pub fn index_freshness(mut self, freshness: IndexFreshness) -> Self {
         self.index_freshness = freshness;
         self
@@ -248,7 +254,7 @@ impl InoxSetBuilder {
             }
         };
 
-        Ok(crate::InoxSet {
+        let store = crate::InoxSet {
             path,
             parts_root,
             catalog,
@@ -264,7 +270,17 @@ impl InoxSetBuilder {
             clock,
             inverted,
             index_freshness: self.index_freshness,
-        })
+        };
+
+        // 9. Populate the inverted index from the catalog. A reopened store
+        // must serve find_memberships immediately: leaving the index empty
+        // until the first flush silently returns no results for entities
+        // that are present and queryable through every other path.
+        if matches!(store.inverted, crate::InvertedStore::Frozen(_)) {
+            store.rebuild_inverted_index()?;
+        }
+
+        Ok(store)
     }
 }
 

@@ -165,7 +165,11 @@ impl InoxSet {
     }
 
     /// Rebuilds the inverted index from the current ReadIndex + catalog data.
-    fn rebuild_inverted_index(&self) -> Result<()> {
+    ///
+    /// Also called by the builder at open time so a reopened store serves
+    /// [`find_memberships`](Self::find_memberships) immediately instead of
+    /// silently returning no results until the first flush.
+    pub(crate) fn rebuild_inverted_index(&self) -> Result<()> {
         match &self.inverted {
             InvertedStore::None => Ok(()),
             InvertedStore::Frozen(swap) => {
@@ -604,20 +608,27 @@ impl InoxSet {
             // Check inverted index for this specific (event, period).
             let found = idx.contains(external_id, event, &period);
             if found {
-                // Check mempart delta — entity may have been tombstoned after last flush.
-                if let Some(internal_id) = dict::lookup(&self.catalog, external_id)? {
-                    let mp = self.writer.read().map_err(|e| {
-                        log::error!("RwLock poisoned: {e}");
-                        InoxSetError::Closed
-                    })?;
-                    if mp
-                        .get_delta(event, &period)
-                        .is_some_and(|d| d.contains(internal_id))
-                    {
-                        return Ok(false); // tombstoned in mempart
+                // The frozen index may be stale: the entity can have been
+                // tombstoned (remove_ids) or fully erased (delete_entity)
+                // since the last rebuild.
+                match dict::lookup(&self.catalog, external_id)? {
+                    Some(internal_id) => {
+                        let mp = self.writer.read().map_err(|e| {
+                            log::error!("RwLock poisoned: {e}");
+                            InoxSetError::Closed
+                        })?;
+                        if mp
+                            .get_delta(event, &period)
+                            .is_some_and(|d| d.contains(internal_id))
+                        {
+                            return Ok(false); // tombstoned in mempart
+                        }
+                        return Ok(true);
                     }
+                    // Dict entry deleted (delete_entity) — read-your-deletes:
+                    // the entity is no longer a member of anything.
+                    None => return Ok(false),
                 }
-                return Ok(true);
             }
             // Check mempart for unflushed data.
             if let Some(internal_id) = dict::lookup(&self.catalog, external_id)? {
@@ -1554,6 +1565,54 @@ impl InoxSet {
         let a = self.get_shared(event_a, period_a)?;
         let b = self.get_shared(event_b, period_b)?;
         Ok(a.union_len(&b))
+    }
+
+    /// Returns the cardinality of the union of N bitmaps.
+    ///
+    /// Folds all `(event, period)` keys into a single accumulator and counts
+    /// once — one allocation total instead of the N−1 intermediate bitmaps a
+    /// pairwise [`union_cardinality`](Self::union_cardinality) fold would
+    /// build. Typical use: distinct-ID reach across many time buckets.
+    ///
+    /// Returns `0` for an empty `keys` slice. The member list is never
+    /// returned; only the count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn union_cardinality_many(&self, keys: &[(&str, Period)]) -> Result<u64> {
+        let mut acc = RoaringBitmap::new();
+        for (event, period) in keys {
+            let bm = self.get_shared(event, *period)?;
+            acc |= bm.as_ref();
+        }
+        Ok(acc.len())
+    }
+
+    /// Returns the cardinality of the intersection of N bitmaps.
+    ///
+    /// Folds all `(event, period)` keys into a single accumulator, counting
+    /// once and short-circuiting to `0` as soon as the running intersection
+    /// becomes empty.
+    ///
+    /// Returns `0` for an empty `keys` slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on catalog or file I/O failure.
+    pub fn intersect_cardinality_many(&self, keys: &[(&str, Period)]) -> Result<u64> {
+        let mut iter = keys.iter();
+        let Some((event0, period0)) = iter.next() else {
+            return Ok(0);
+        };
+        let mut acc = self.get_shared(event0, *period0)?.as_ref().clone();
+        for (event, period) in iter {
+            if acc.is_empty() {
+                return Ok(0);
+            }
+            acc &= self.get_shared(event, *period)?.as_ref();
+        }
+        Ok(acc.len())
     }
 
     /// Returns the cardinality for each period in a range, without

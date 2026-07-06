@@ -5,5 +5,7 @@
 # OS files
 .DS_Store
 
-# Claude Code local config (contains absolute paths and local permissions)
+# Local tooling config (absolute paths, per-machine permissions)
 .claude/
+.vscode/
+.idea/

@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - **Export API** — `serialize_portable()` (CRoaring bytes), `export_u32_vec()`, `query_export()`, `query_serialize()`, `export_ids()`, `export_uuids()`.
 - **Standalone Dictionary module** — `Dictionary` struct importable without full store. Methods: `get_or_assign`, `get_or_assign_batch`, `lookup`, `lookup_batch`, `contains`, `resolve`, `resolve_batch`, `delete`, `len`, `is_empty`. UUID batch support.
-- ClickHouse integration examples (internal): CRoaring compat test, segment sync, scale test.
+- ClickHouse integration validation: CRoaring compatibility test, segment sync, scale test.
 - Production scale validation: 8M profiles, 50 segments, 90K QPS on 8 cores.
 - QPS stress test with single-thread and multi-thread benchmarks.
 

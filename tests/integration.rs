@@ -931,7 +931,7 @@ fn put_bitmap_rejects_invalid_period() {
         .is_err()); // 2026 is not a leap year
 }
 
-// --- Inverted index lifecycle (public issues #13, #14) ---
+// --- Inverted index lifecycle: reopen and erasure staleness ---
 
 fn store_with_index(dir: &TempDir) -> InoxSet {
     InoxSet::builder()
@@ -945,7 +945,7 @@ fn store_with_index(dir: &TempDir) -> InoxSet {
 
 #[test]
 fn inverted_index_populated_on_reopen() {
-    // Issue #13: after reopen the index started empty and find_memberships
+    // Regression: after reopen the index started empty and find_memberships
     // silently returned no results until the first flush.
     let dir = TempDir::new().unwrap();
     let p = Period::Day(2026, 3, 11);
@@ -971,7 +971,7 @@ fn inverted_index_populated_on_reopen() {
 
 #[test]
 fn delete_entity_read_your_deletes_with_frozen_index() {
-    // Issue #14: between delete_entity and the next flush, contains_id kept
+    // Regression: between delete_entity and the next flush, contains_id kept
     // returning true because the tombstone check resolved through the
     // dictionary entry that delete_entity had just removed.
     let dir = TempDir::new().unwrap();
@@ -1002,7 +1002,7 @@ fn delete_entity_read_your_deletes_with_frozen_index() {
     assert!(!s.contains_id("ev_a", p, "alice").unwrap());
 }
 
-// --- N-way cardinality (public issue #15) ---
+// --- N-way cardinality ---
 
 #[test]
 fn union_cardinality_many_folds_buckets() {

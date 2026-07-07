@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`delete_period`/`retain_periods` now delete rollup-ancestor periods.** They keyed the catalog by the event's finest granularity while flush stores each period under its own granularity, so Day/Month/Year rollup data of an hourly event silently survived retention (and `retain_periods` still counted it as deleted).
+- **`replace_bitmap`/`bulk_replace` key periods by their own granularity.** Replacing a `Static` period on a time-bucketed event previously created a second catalog key for the same logical period, making subsequent reads nondeterministic.
+- **`cardinality_range` validates its bounds** like `get_range`; unreachable bounds (e.g. Feb 30) no longer iterate unboundedly, and the period enumerator additionally stops as soon as it passes `end`.
+- **Inverted index rebuilds fail loudly on id-space overflow** (more than 32 767 events or 65 536 distinct periods) instead of silently wrapping ids and returning memberships for the wrong event/period.
 - **Inverted index is populated at store open.** Previously a reopened store served an empty index until the first flush, so `find_memberships`/`contains_id` silently returned no results for entities that were present. Open latency grows with store size when the index is enabled; see `index_freshness` docs.
 - **`contains_id` honors `delete_entity` immediately.** The staleness check resolved through the dictionary entry that `delete_entity` had just removed, so the frozen-index path kept answering `true` until flush+compact. Read-your-deletes now holds on every read path.
 

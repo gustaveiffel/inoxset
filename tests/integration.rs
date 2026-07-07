@@ -1059,3 +1059,91 @@ fn intersect_cardinality_many_short_circuits() {
         0
     );
 }
+
+// --- Catalog-key granularity consistency (retention on rollup events) ---
+
+#[test]
+fn delete_period_removes_rollup_ancestor_data() {
+    // Regression: delete_period keyed by the event's finest granularity, so
+    // rollup-ancestor periods (Day/Month/Year of an hourly event) were
+    // silently never deleted — retention left rollup data behind.
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+    s.put_bitmap("ev", Period::Hour(2026, 3, 11, 14), bm_of(&[42]))
+        .unwrap();
+    s.flush().unwrap();
+    assert!(s.get("ev", Period::Day(2026, 3, 11)).unwrap().contains(42));
+
+    s.delete_period("ev", Period::Day(2026, 3, 11)).unwrap();
+
+    assert!(
+        s.get("ev", Period::Day(2026, 3, 11)).unwrap().is_empty(),
+        "rollup-ancestor period must actually be deleted"
+    );
+    // The hour itself is a different period and must survive.
+    assert!(s
+        .get("ev", Period::Hour(2026, 3, 11, 14))
+        .unwrap()
+        .contains(42));
+}
+
+#[test]
+fn retain_periods_purges_rollup_ancestors() {
+    // Keep nothing: every period listed (hours AND rollup ancestors) must go.
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+    s.put_bitmap("ev", Period::Hour(2026, 3, 11, 14), bm_of(&[42]))
+        .unwrap();
+    s.flush().unwrap();
+
+    let listed = s.list_periods("ev").unwrap().len();
+    let deleted = s.retain_periods("ev", |_| false).unwrap();
+    assert_eq!(deleted as usize, listed);
+
+    for p in [
+        Period::Hour(2026, 3, 11, 14),
+        Period::Day(2026, 3, 11),
+        Period::Month(2026, 3),
+        Period::Year(2026),
+    ] {
+        assert!(
+            s.get("ev", p).unwrap().is_empty(),
+            "period {p:?} must be gone after retain_periods(|_| false)"
+        );
+    }
+    assert!(s.list_periods("ev").unwrap().is_empty());
+}
+
+#[test]
+fn replace_bitmap_static_period_on_time_bucketed_event() {
+    // Regression: replace_bitmap keyed Static under the event's finest
+    // granularity ("ev/hour/_static"), diverging from the flush key
+    // ("ev/none/_static") and making reads nondeterministic.
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+
+    s.put_bitmap("ev", Period::Static, bm_of(&[1, 2])).unwrap();
+    s.flush().unwrap();
+
+    s.replace_bitmap("ev", Period::Static, bm_of(&[99])).unwrap();
+
+    let got = s.get("ev", Period::Static).unwrap();
+    assert!(got.contains(99));
+    assert!(!got.contains(1), "replace must supersede the flushed bitmap");
+    assert_eq!(got.len(), 1);
+    assert_eq!(s.list_periods("ev").unwrap(), vec![Period::Static]);
+}
+
+#[test]
+fn cardinality_range_invalid_bound_is_rejected() {
+    // Same unbounded-iteration guard as get_range.
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    assert!(s
+        .cardinality_range("ev", Period::Day(2026, 2, 1), Period::Day(2026, 2, 30))
+        .is_err());
+    let got = s
+        .cardinality_range("ev", Period::Day(2026, 3, 12), Period::Day(2026, 3, 10))
+        .unwrap();
+    assert!(got.is_empty(), "reversed bounds must yield empty, not hang");
+}

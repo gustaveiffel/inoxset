@@ -206,6 +206,22 @@ impl InoxSet {
             }
         }
 
+        // Membership packs (event_id, period_id) into 15 + 16 bits. Beyond
+        // these bounds the `as u16` casts above have already wrapped, which
+        // would silently point memberships at the wrong event/period —
+        // refuse to build the index instead.
+        const MAX_INDEX_EVENTS: usize = 0x7FFF; // high bit reserved for extended refs
+        const MAX_INDEX_PERIODS: usize = 1 << 16;
+        if event_names.len() > MAX_INDEX_EVENTS || periods_vec.len() > MAX_INDEX_PERIODS {
+            return Err(InoxSetError::Configuration(format!(
+                "inverted index cannot represent {} events / {} periods \
+                 (max {MAX_INDEX_EVENTS} / {MAX_INDEX_PERIODS}); \
+                 open the store with IndexFreshness::Disabled",
+                event_names.len(),
+                periods_vec.len(),
+            )));
+        }
+
         let mut builder = inverted::InvertedIndexBuilder::new(event_names, periods_vec);
 
         // For each (event, period), read bitmap, reverse-lookup u32 → external_id.
@@ -392,13 +408,16 @@ impl InoxSet {
             mp.deltas.remove(&(event.to_string(), period));
         }
 
-        // Look up event config to build the catalog key.
-        let config = match self.catalog.get_event(event)? {
-            Some(c) => c,
-            None => return Ok(()), // Event not registered → nothing to delete.
-        };
+        // Nothing to delete if the event was never registered.
+        if self.catalog.get_event(event)?.is_none() {
+            return Ok(());
+        }
 
-        let cat_key = period::catalog_key(event, config.finest_granularity, &period);
+        // Key by the period's own granularity: flush stores rollup-ancestor
+        // periods under their granularity (e.g. "ev/day/…" for an hourly
+        // event), so keying by the event's finest granularity would silently
+        // miss them and retention would leave rollup data behind.
+        let cat_key = period::catalog_key(event, period.granularity(), &period);
         let parts = self.catalog.delete_period_returning_parts(&cat_key)?;
         self.rebuild_read_index()?;
         for part in &parts {
@@ -1497,8 +1516,11 @@ impl InoxSet {
         }
 
         if !has_mempart_data && !has_mempart_delta {
-            if let Some(config) = self.catalog.get_event(event)? {
-                let cat_key = catalog_key(event, config.finest_granularity, &period);
+            if self.catalog.get_event(event)?.is_some() {
+                // Key by the period's own granularity, matching the keys the
+                // flush and compaction paths write — the event's finest
+                // granularity would miss rollup-ancestor periods.
+                let cat_key = catalog_key(event, period.granularity(), &period);
                 if let Some(state) = self.catalog.get_period_state(&cat_key)? {
                     if state == PeriodState::Compacted {
                         let data_ids = self.catalog.get_period_parts(&cat_key)?;
@@ -1632,6 +1654,10 @@ impl InoxSet {
         end: Period,
     ) -> Result<Vec<(Period, u64)>> {
         self.check_closed()?;
+        // Same guard as get_range: an out-of-range bound (e.g. Feb 30) can
+        // never be reached by period iteration.
+        start.validate()?;
+        end.validate()?;
         let periods = Self::enumerate_periods(start, end);
         const MAX_RANGE_PERIODS: usize = 366 * 24;
         if periods.len() > MAX_RANGE_PERIODS {
@@ -1772,6 +1798,12 @@ impl InoxSet {
         let mut periods = Vec::new();
         let mut current = Some(start);
         while let Some(p) = current {
+            // Defense in depth: if `end` has out-of-range components the
+            // iteration steps over it without ever matching; stop as soon
+            // as we pass it instead of running to year overflow.
+            if p > end {
+                break;
+            }
             periods.push(p);
             if p == end {
                 break;
@@ -1887,7 +1919,11 @@ impl InoxSet {
             mp.deltas.remove(&(event.to_string(), period));
         }
 
-        let cat_key = catalog_key(event, config.finest_granularity, &period);
+        // Key by the period's own granularity, matching flush/get/ReadIndex.
+        // Keying by the event's finest granularity would create a second
+        // catalog key for the same logical period (e.g. "ev/hour/_static"
+        // next to "ev/none/_static"), making reads nondeterministic.
+        let cat_key = catalog_key(event, period.granularity(), &period);
 
         // Pre-collect old part IDs and file paths BEFORE the transaction,
         // because the txn will remove those catalog entries making them
@@ -2014,10 +2050,11 @@ impl InoxSet {
             }
         }
 
-        // Collect old part info before the write txn.
+        // Collect old part info before the write txn. Keys use the period's
+        // own granularity, matching flush/get/ReadIndex (see replace_bitmap).
         let mut old_parts_by_period: Vec<(String, Vec<u64>, Vec<u64>)> = Vec::new();
         for (period, _) in entries {
-            let cat_key = catalog_key(event, config.finest_granularity, period);
+            let cat_key = catalog_key(event, period.granularity(), period);
             let old_data_ids = self.catalog.get_period_parts(&cat_key)?;
             let old_delta_ids = self.catalog.get_period_deltas(&cat_key)?;
 

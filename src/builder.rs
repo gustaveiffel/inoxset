@@ -247,10 +247,15 @@ impl InoxSetBuilder {
                 crate::InvertedStore::Frozen(arc_swap::ArcSwap::from_pointee(idx))
             }
             IndexFreshness::Immediate => {
-                log::warn!(
-                    "IndexFreshness::Immediate not yet implemented, falling back to Disabled"
-                );
-                crate::InvertedStore::None
+                // Silently degrading to a disabled index would make every
+                // find_memberships call scan bitmaps while the caller
+                // believes they opted into the freshest index — fail loud
+                // until Immediate is implemented.
+                return Err(InoxSetError::Configuration(
+                    "IndexFreshness::Immediate is not implemented yet; \
+                     use OnFlush, OnCompact, or Disabled"
+                        .to_string(),
+                ));
             }
         };
 

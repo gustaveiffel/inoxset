@@ -226,6 +226,24 @@ pub fn batch_assign_or_get(cat: &Catalog, external_ids: &[&str]) -> crate::Resul
     Ok(result.into_iter().flatten().collect())
 }
 
+/// Resolves external IDs to internal `u32`s in **one** read transaction,
+/// without assigning IDs to unknown entries.
+///
+/// Returns a `Vec<Option<u32>>` in the **same order** as the input slice;
+/// an entry is `None` when the external ID has never been assigned.
+///
+/// # Errors
+///
+/// Returns an error on any LMDB I/O failure.
+pub fn batch_lookup(cat: &Catalog, external_ids: &[&str]) -> crate::Result<Vec<Option<u32>>> {
+    let rtxn = cat.env().read_txn()?;
+    let mut result = Vec::with_capacity(external_ids.len());
+    for &ext in external_ids {
+        result.push(cat.dict_fwd.get(&rtxn, ext)?.map(|v| v as u32));
+    }
+    Ok(result)
+}
+
 /// Resolves a batch of internal `u32` IDs to their external string
 /// representations.
 ///

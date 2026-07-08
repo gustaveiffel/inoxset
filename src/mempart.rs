@@ -105,6 +105,40 @@ impl MemPart {
             .wrapping_sub(old_size as u64);
     }
 
+    /// OR `bitmap` into the additive entry for `(event, period)`, sharing the
+    /// `Arc` allocation when no entry exists yet.
+    ///
+    /// This is the range-write fast path: a range put inserts the same bitmap
+    /// into hundreds of vacant buckets, and cloning the bitmap per bucket
+    /// would multiply memory by the range length while the write lock is
+    /// held. Vacant entries get an `Arc::clone` (O(1)); occupied entries fall
+    /// back to a real OR, identical to [`or_bitmap`](Self::or_bitmap).
+    ///
+    /// `size_bytes` intentionally counts the serialized size **per entry**
+    /// even when the allocation is shared: each entry still flushes as its
+    /// own part file, so the flush-threshold proxy stays honest.
+    pub fn or_bitmap_shared(&mut self, event: &str, period: Period, bitmap: &Arc<RoaringBitmap>) {
+        let key = (event.to_string(), period);
+        match self.bitmaps.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                self.size_bytes = self
+                    .size_bytes
+                    .wrapping_add(bitmap.serialized_size() as u64);
+                v.insert(Arc::clone(bitmap));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let existing = Arc::make_mut(o.get_mut());
+                let old_size = existing.serialized_size();
+                *existing |= bitmap.as_ref();
+                let new_size = existing.serialized_size();
+                self.size_bytes = self
+                    .size_bytes
+                    .wrapping_add(new_size as u64)
+                    .wrapping_sub(old_size as u64);
+            }
+        }
+    }
+
     /// Removes `bitmap`'s bits from the delete-delta entry for `(event, period)`.
     ///
     /// Called by `put_bitmap`: a put supersedes any earlier pending remove of
@@ -313,6 +347,43 @@ mod tests {
         assert!(mp.get_delta("ev", &Period::Static).is_none());
         assert!(mp.is_empty());
         assert_eq!(mp.size_bytes(), 0, "size must not underflow");
+    }
+
+    #[test]
+    fn or_bitmap_shared_vacant_shares_allocation() {
+        let mut mp = MemPart::new();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(42);
+        let shared = Arc::new(bm);
+
+        mp.or_bitmap_shared("ev", Period::Day(2026, 3, 11), &shared);
+        mp.or_bitmap_shared("ev", Period::Day(2026, 3, 12), &shared);
+
+        let e1 = mp.get_bitmap("ev", &Period::Day(2026, 3, 11)).unwrap();
+        let e2 = mp.get_bitmap("ev", &Period::Day(2026, 3, 12)).unwrap();
+        assert!(Arc::ptr_eq(&e1, &shared), "vacant insert must share the Arc");
+        assert!(Arc::ptr_eq(&e2, &shared));
+        // Both entries are counted individually in the size proxy.
+        assert_eq!(mp.size_bytes(), 2 * shared.serialized_size() as u64);
+    }
+
+    #[test]
+    fn or_bitmap_shared_occupied_ors_without_aliasing() {
+        let mut mp = MemPart::new();
+        let mut existing = RoaringBitmap::new();
+        existing.insert(1);
+        mp.or_bitmap("ev", Period::Day(2026, 3, 11), &existing);
+
+        let mut bm = RoaringBitmap::new();
+        bm.insert(2);
+        let shared = Arc::new(bm);
+        mp.or_bitmap_shared("ev", Period::Day(2026, 3, 11), &shared);
+
+        let got = mp.get_bitmap("ev", &Period::Day(2026, 3, 11)).unwrap();
+        assert!(got.contains(1) && got.contains(2));
+        assert!(!Arc::ptr_eq(&got, &shared), "occupied entry must not alias");
+        // The shared source bitmap is untouched.
+        assert_eq!(shared.len(), 1);
     }
 
     #[test]

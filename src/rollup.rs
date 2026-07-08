@@ -135,6 +135,30 @@ pub fn clear_rollup_delta(
     }
 }
 
+/// Returns the distinct rollup-ancestor periods of `periods`, filtered by
+/// `config.rollup_chain`, sorted and deduplicated.
+///
+/// Range writes use this to apply each ancestor exactly once: hundreds of
+/// hourly buckets share a handful of Day/Month/Year ancestors, and OR-ing
+/// the same bitmap into an ancestor once is equivalent to OR-ing it once
+/// per bucket (idempotent).
+///
+/// Returns an empty `Vec` when `config.rollup != Rollup::Auto`.
+pub fn distinct_rollup_ancestors(config: &EventConfig, periods: &[Period]) -> Vec<Period> {
+    if config.rollup != Rollup::Auto {
+        return Vec::new();
+    }
+    let mut set = std::collections::BTreeSet::new();
+    for period in periods {
+        for ancestor in period.ancestors() {
+            if config.rollup_chain.contains(&ancestor.granularity()) {
+                set.insert(ancestor);
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +287,41 @@ mod tests {
 
         let year_delta = mp.get_delta("active", &Period::Year(2026)).unwrap();
         assert_eq!(year_delta.len(), 2);
+    }
+
+    #[test]
+    fn distinct_ancestors_dedups_within_day() {
+        let config = EventConfig::new("ev".into(), Granularity::Hour, Rollup::Auto);
+        let periods: Vec<Period> = (0..24).map(|h| Period::Hour(2026, 3, 11, h)).collect();
+        // 24 hourly buckets collapse to exactly one Day, one Month, one Year.
+        assert_eq!(
+            distinct_rollup_ancestors(&config, &periods),
+            vec![
+                Period::Day(2026, 3, 11),
+                Period::Month(2026, 3),
+                Period::Year(2026),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_ancestors_month_boundary() {
+        let config = EventConfig::new("ev".into(), Granularity::Hour, Rollup::Auto);
+        let periods = vec![Period::Hour(2026, 1, 31, 23), Period::Hour(2026, 2, 1, 0)];
+        let ancestors = distinct_rollup_ancestors(&config, &periods);
+        assert_eq!(ancestors.len(), 5); // 2 Days + 2 Months + 1 Year
+        assert!(ancestors.contains(&Period::Day(2026, 1, 31)));
+        assert!(ancestors.contains(&Period::Day(2026, 2, 1)));
+        assert!(ancestors.contains(&Period::Month(2026, 1)));
+        assert!(ancestors.contains(&Period::Month(2026, 2)));
+        assert!(ancestors.contains(&Period::Year(2026)));
+    }
+
+    #[test]
+    fn distinct_ancestors_empty_when_rollup_none() {
+        let config = EventConfig::new("ev".into(), Granularity::Hour, Rollup::None);
+        let periods = vec![Period::Hour(2026, 3, 11, 14)];
+        assert!(distinct_rollup_ancestors(&config, &periods).is_empty());
     }
 
     #[test]

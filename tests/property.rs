@@ -155,3 +155,108 @@ proptest! {
         prop_assert_eq!(health.total_delta_parts, 0);
     }
 }
+
+fn store_rollup_day(dir: &TempDir) -> InoxSet {
+    InoxSet::builder()
+        .path(dir.path().join("data"))
+        .default_granularity(Granularity::Day)
+        .default_rollup(Rollup::Auto)
+        .open()
+        .unwrap()
+}
+
+/// All periods of a Day range plus its rollup ancestors, for equivalence checks.
+fn day_range_and_ancestors(start_day: u8, len: usize) -> (Vec<Period>, Vec<Period>) {
+    let mut buckets = Vec::new();
+    let (mut m, mut d) = (3u8, start_day);
+    for _ in 0..len {
+        buckets.push(Period::Day(2026, m, d));
+        d += 1;
+        if (m == 3 && d > 31) || (m == 4 && d > 30) {
+            m += 1;
+            d = 1;
+        }
+    }
+    let ancestors = vec![
+        Period::Month(2026, 3),
+        Period::Month(2026, 4),
+        Period::Year(2026),
+    ];
+    (buckets, ancestors)
+}
+
+proptest! {
+    /// put_bitmap_range ≡ looped put_bitmap, for every bucket and ancestor,
+    /// before and after flush.
+    #[test]
+    fn range_put_equiv_looped_put(
+        bm in arb_bitmap(10_000, 200),
+        start_day in 20u8..=28,
+        len in 1usize..=14,
+    ) {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = store_rollup_day(&dir_a);
+        let b = store_rollup_day(&dir_b);
+        let (buckets, ancestors) = day_range_and_ancestors(start_day, len);
+
+        a.put_bitmap_range("ev", buckets[0], *buckets.last().unwrap(), bm.clone()).unwrap();
+        for p in &buckets {
+            b.put_bitmap("ev", *p, bm.clone()).unwrap();
+        }
+
+        for p in buckets.iter().chain(ancestors.iter()) {
+            prop_assert_eq!(
+                a.get("ev", *p).unwrap(),
+                b.get("ev", *p).unwrap(),
+                "pre-flush divergence at {:?}", p
+            );
+        }
+        a.flush().unwrap();
+        b.flush().unwrap();
+        for p in buckets.iter().chain(ancestors.iter()) {
+            prop_assert_eq!(
+                a.get("ev", *p).unwrap(),
+                b.get("ev", *p).unwrap(),
+                "post-flush divergence at {:?}", p
+            );
+        }
+    }
+
+    /// remove_bits_range ≡ looped remove_bits after identical seeding.
+    #[test]
+    fn range_remove_equiv_looped_remove(
+        bm in arb_bitmap(10_000, 200),
+        removed in arb_bitmap(10_000, 100),
+        start_day in 20u8..=28,
+        len in 1usize..=14,
+    ) {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = store_rollup_day(&dir_a);
+        let b = store_rollup_day(&dir_b);
+        let (buckets, ancestors) = day_range_and_ancestors(start_day, len);
+        let (first, last) = (buckets[0], *buckets.last().unwrap());
+        let ids: Vec<u32> = removed.iter().collect();
+
+        a.put_bitmap_range("ev", first, last, bm.clone()).unwrap();
+        b.put_bitmap_range("ev", first, last, bm.clone()).unwrap();
+        a.flush().unwrap();
+        b.flush().unwrap();
+
+        if !ids.is_empty() {
+            a.remove_bits_range("ev", first, last, &ids).unwrap();
+            for p in &buckets {
+                b.remove_bits("ev", *p, &ids).unwrap();
+            }
+        }
+
+        for p in buckets.iter().chain(ancestors.iter()) {
+            prop_assert_eq!(
+                a.get("ev", *p).unwrap(),
+                b.get("ev", *p).unwrap(),
+                "divergence at {:?}", p
+            );
+        }
+    }
+}

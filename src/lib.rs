@@ -19,6 +19,15 @@
 //! store.register_event("active", Granularity::Day, Rollup::Auto)?;
 //! store.put_ids("active", Period::Day(2026, 5, 20), &["user-1", "user-2"])?;
 //!
+//! // Interval facts (stays, subscriptions, coverage periods) write every
+//! // covered bucket in one atomic call:
+//! store.put_ids_range(
+//!     "active",
+//!     Period::Day(2026, 5, 21),
+//!     Period::Day(2026, 5, 24),
+//!     &["user-1"],
+//! )?;
+//!
 //! let segments = store.find_memberships("user-1")?;
 //! # Ok::<(), inoxset::error::InoxSetError>(())
 //! ```
@@ -128,6 +137,12 @@ pub struct InoxSet {
     #[allow(dead_code)]
     pub(crate) index_freshness: types::IndexFreshness,
 }
+
+/// Upper bound on the number of periods a range operation may span
+/// (~1 year of hourly buckets). Guards against unbounded iteration and
+/// unbounded memory in `get_range`, `cardinality_range`, and the range
+/// write APIs.
+const MAX_RANGE_PERIODS: usize = 366 * 24;
 
 impl InoxSet {
     /// Create a new builder for configuring and opening an InoxSet store.
@@ -970,6 +985,61 @@ impl InoxSet {
         self.remove_bits(event, period, &bits)
     }
 
+    /// Writes a set of UUIDs into every period bucket from `first` to `last`
+    /// (inclusive).
+    ///
+    /// The dictionary is resolved once; all buckets share the resulting
+    /// bitmap. See [`put_bitmap_range`](Self::put_bitmap_range) for range
+    /// semantics, atomicity, and errors.
+    #[cfg(feature = "uuid")]
+    pub fn put_uuids_range(
+        &self,
+        event: &str,
+        first: Period,
+        last: Period,
+        ids: &[Uuid],
+    ) -> Result<()> {
+        self.check_writable()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let internal_ids = dict::batch_assign_or_get_uuids(&self.catalog, ids)?;
+        let mut bitmap = RoaringBitmap::new();
+        for id in internal_ids {
+            bitmap.insert(id);
+        }
+        self.put_bitmap_range(event, first, last, bitmap)
+    }
+
+    /// Removes UUIDs from every period bucket from `first` to `last`
+    /// (inclusive) via delta tombstones.
+    ///
+    /// UUIDs never assigned in the dictionary are silently ignored. See
+    /// [`remove_bits_range`](Self::remove_bits_range) for semantics.
+    #[cfg(feature = "uuid")]
+    pub fn remove_uuids_range(
+        &self,
+        event: &str,
+        first: Period,
+        last: Period,
+        ids: &[Uuid],
+    ) -> Result<()> {
+        self.check_writable()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let strings: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+        let bits: Vec<u32> = dict::batch_lookup(&self.catalog, &refs)?
+            .into_iter()
+            .flatten()
+            .collect();
+        if bits.is_empty() {
+            return Ok(());
+        }
+        self.remove_bits_range(event, first, last, &bits)
+    }
+
     /// GDPR erasure for a UUID entity.
     ///
     /// # Errors
@@ -1094,6 +1164,253 @@ impl InoxSet {
             self.flush_internal()?;
         }
 
+        Ok(())
+    }
+
+    // ─── Range writes (interval membership) ─────────────────────────────────
+
+    /// Writes `bitmap` into **every** period bucket from `first` to `last`
+    /// (inclusive), OR-accumulating with existing data.
+    ///
+    /// This is the interval-membership primitive: an entity that belongs to
+    /// a segment over a validity interval (a stay, a subscription, a policy
+    /// coverage period) is written once instead of once per covered bucket.
+    ///
+    /// All buckets and their rollup ancestors are mutated under a single
+    /// write-lock acquisition, so **readers never observe a partially
+    /// applied range**. For [`Rollup::Auto`] events each distinct ancestor
+    /// (Day/Month/Year) is OR'd exactly once, not once per bucket.
+    /// Durability still requires [`flush`](Self::flush) (or the automatic
+    /// threshold flush; note that a large range put grows the write buffer
+    /// by roughly `buckets × bitmap size` in one call and may trigger it
+    /// immediately).
+    ///
+    /// Unlike [`get_range`](Self::get_range), invalid bounds are **errors**,
+    /// not silent no-ops: writes fail loud.
+    ///
+    /// An empty `bitmap` is a validated no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InoxSetError::ReadOnly`] if the store is read-only.
+    /// Returns [`InoxSetError::InvalidPeriod`] for Static or malformed bounds.
+    /// Returns [`InoxSetError::GranularityMismatch`] if either bound does not
+    /// match the event's finest granularity.
+    /// Returns [`InoxSetError::Configuration`] for reversed or oversized
+    /// ranges (more than 366×24 buckets).
+    pub fn put_bitmap_range(
+        &self,
+        event: &str,
+        first: Period,
+        last: Period,
+        bitmap: RoaringBitmap,
+    ) -> Result<()> {
+        self.check_writable()?;
+        let config = self.ensure_event(event)?;
+        let periods = Self::checked_write_range(event, &config, first, last, "put_bitmap_range")?;
+        if bitmap.is_empty() {
+            return Ok(());
+        }
+
+        let ancestors = rollup::distinct_rollup_ancestors(&config, &periods);
+
+        // Backfill pass, before the write lock: revert Compacted→Closed for
+        // any closed bucket so it can accept writes again. One read txn to
+        // scan, one write txn for the reverts (instead of two LMDB txns per
+        // bucket). Reverting is harmless even if a later step fails — it
+        // only makes compaction redo work.
+        self.revert_compacted_periods(event, &periods)?;
+
+        // Single lock acquisition: everything inside is infallible, so a
+        // partially applied range is structurally impossible.
+        let shared = Arc::new(bitmap);
+        let should_flush;
+        {
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            for p in &periods {
+                mp.or_bitmap_shared(event, *p, &shared);
+            }
+            // Once per distinct ancestor — valid ONLY because every bucket
+            // receives the same bitmap, so the per-ancestor union of
+            // contributing buckets is the bitmap itself.
+            for a in &ancestors {
+                mp.or_bitmap(event, *a, &shared);
+            }
+            // A put supersedes pending removes of the same bits, at every
+            // bucket and every ancestor (same semantics as put_bitmap).
+            for p in &periods {
+                mp.clear_delta_bits(event, p, &shared);
+            }
+            for a in &ancestors {
+                mp.clear_delta_bits(event, a, &shared);
+            }
+            should_flush = mp.size_bytes() >= self.flush_threshold;
+        }
+
+        if should_flush {
+            self.flush_internal()?;
+        }
+        Ok(())
+    }
+
+    /// Writes a set of external IDs into every period bucket from `first`
+    /// to `last` (inclusive).
+    ///
+    /// The dictionary is resolved **once**; all buckets share the resulting
+    /// bitmap. See [`put_bitmap_range`](Self::put_bitmap_range) for range
+    /// semantics, atomicity, and errors.
+    pub fn put_ids_range(
+        &self,
+        event: &str,
+        first: Period,
+        last: Period,
+        external_ids: &[&str],
+    ) -> Result<()> {
+        self.check_writable()?;
+        if external_ids.is_empty() {
+            return Ok(());
+        }
+        let internal_ids = dict::batch_assign_or_get(&self.catalog, external_ids)?;
+        let mut bitmap = RoaringBitmap::new();
+        for id in internal_ids {
+            bitmap.insert(id);
+        }
+        self.put_bitmap_range(event, first, last, bitmap)
+    }
+
+    /// Removes user IDs from every period bucket from `first` to `last`
+    /// (inclusive) via delta (tombstone) bitmaps.
+    ///
+    /// For [`Rollup::Auto`] events the delta also propagates once per
+    /// distinct rollup ancestor. **Note the rollup-erasure semantics**
+    /// (inherited from [`remove_bits`](Self::remove_bits)): removing an
+    /// interval at Hour granularity erases the IDs from the covering
+    /// Day/Month/Year rollups even when out-of-range hours still contain
+    /// them.
+    ///
+    /// All buckets and ancestors are tombstoned under a single write-lock
+    /// acquisition. Unlike `remove_bits`, this range variant checks the
+    /// auto-flush threshold (a bulk range remove can buffer a lot of delta
+    /// data).
+    ///
+    /// # Errors
+    ///
+    /// Same validation errors as [`put_bitmap_range`](Self::put_bitmap_range).
+    pub fn remove_bits_range(
+        &self,
+        event: &str,
+        first: Period,
+        last: Period,
+        user_ids: &[u32],
+    ) -> Result<()> {
+        self.check_writable()?;
+        let config = self.ensure_event(event)?;
+        let periods = Self::checked_write_range(event, &config, first, last, "remove_bits_range")?;
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut delta = RoaringBitmap::new();
+        for &id in user_ids {
+            delta.insert(id);
+        }
+        let ancestors = rollup::distinct_rollup_ancestors(&config, &periods);
+
+        let should_flush;
+        {
+            let mut mp = self.writer.write().map_err(|e| {
+                log::error!("RwLock poisoned: {e}");
+                InoxSetError::Closed
+            })?;
+            for p in &periods {
+                mp.or_delta(event, *p, &delta);
+            }
+            // Dedup is valid: every bucket contributes the identical delta,
+            // and OR-ing it into an ancestor is idempotent.
+            for a in &ancestors {
+                mp.or_delta(event, *a, &delta);
+            }
+            should_flush = mp.size_bytes() >= self.flush_threshold;
+        }
+
+        if should_flush {
+            self.flush_internal()?;
+        }
+        Ok(())
+    }
+
+    /// Removes external IDs from every period bucket from `first` to `last`
+    /// (inclusive).
+    ///
+    /// The dictionary is resolved once; IDs that have never been assigned
+    /// are silently ignored. See
+    /// [`remove_bits_range`](Self::remove_bits_range) for semantics.
+    pub fn remove_ids_range(
+        &self,
+        event: &str,
+        first: Period,
+        last: Period,
+        external_ids: &[&str],
+    ) -> Result<()> {
+        self.check_writable()?;
+        if external_ids.is_empty() {
+            return Ok(());
+        }
+        let bits: Vec<u32> = dict::batch_lookup(&self.catalog, external_ids)?
+            .into_iter()
+            .flatten()
+            .collect();
+        if bits.is_empty() {
+            return Ok(());
+        }
+        self.remove_bits_range(event, first, last, &bits)
+    }
+
+    /// Reverts `Compacted` periods among `periods` back to `Closed` so they
+    /// can accept writes again (backfill support for range writes).
+    ///
+    /// Uses one read transaction to find the compacted buckets and one write
+    /// transaction for all reverts.
+    fn revert_compacted_periods(&self, event: &str, periods: &[Period]) -> Result<()> {
+        let now = self.now_unix();
+        let closed_keys: Vec<String> = periods
+            .iter()
+            .filter(|p| p.is_closed(now))
+            .map(|p| catalog_key(event, p.granularity(), p))
+            .collect();
+        if closed_keys.is_empty() {
+            return Ok(());
+        }
+
+        let compacted: Vec<&String> = {
+            let txn = self.catalog.env().read_txn()?;
+            let mut found = Vec::new();
+            for key in &closed_keys {
+                if let Some(PeriodState::Compacted) =
+                    Catalog::txn_get_period_state(&self.catalog.period_state, &txn, key)?
+                {
+                    found.push(key);
+                }
+            }
+            found
+        };
+        if compacted.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self.catalog.env().write_txn()?;
+        for key in compacted {
+            Catalog::txn_set_period_state(
+                &self.catalog.period_state,
+                &mut txn,
+                key,
+                PeriodState::Closed,
+            )?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
@@ -1473,7 +1790,6 @@ impl InoxSet {
         end.validate()?;
         let periods = Self::enumerate_periods(start, end);
         // Guard against unbounded ranges that would degrade into a DoS.
-        const MAX_RANGE_PERIODS: usize = 366 * 24; // ~1 year of hours
         if periods.len() > MAX_RANGE_PERIODS {
             return Err(InoxSetError::Configuration(format!(
                 "get_range spans {} periods, limit is {}",
@@ -1659,7 +1975,6 @@ impl InoxSet {
         start.validate()?;
         end.validate()?;
         let periods = Self::enumerate_periods(start, end);
-        const MAX_RANGE_PERIODS: usize = 366 * 24;
         if periods.len() > MAX_RANGE_PERIODS {
             return Err(InoxSetError::Configuration(format!(
                 "cardinality_range spans {} periods, limit is {}",
@@ -1775,6 +2090,46 @@ impl InoxSet {
         // General case: materialize and count
         let bm = self.query(expr)?;
         Ok(bm.len())
+    }
+
+    /// Validates the bounds of a range *write* and enumerates its buckets.
+    ///
+    /// Deliberately stricter than the read ranges: `get_range` treats a
+    /// reversed or Static range as empty, but for a write a silent no-op
+    /// hides caller bugs, so every invalid shape is an error here.
+    fn checked_write_range(
+        event: &str,
+        config: &EventConfig,
+        first: Period,
+        last: Period,
+        op: &str,
+    ) -> Result<Vec<Period>> {
+        if first == Period::Static || last == Period::Static {
+            return Err(InoxSetError::InvalidPeriod {
+                period: Period::Static,
+                reason: format!("{op} does not accept Static periods"),
+            });
+        }
+        first.validate()?;
+        last.validate()?;
+        // Enforces both "same granularity as each other" and "equal to the
+        // event's finest granularity" in one check per bound.
+        Self::validate_granularity(event, config, &first)?;
+        Self::validate_granularity(event, config, &last)?;
+        if first > last {
+            return Err(InoxSetError::Configuration(format!(
+                "{op}: first period {first:?} is after last period {last:?}",
+            )));
+        }
+        let periods = Self::enumerate_periods(first, last);
+        if periods.len() > MAX_RANGE_PERIODS {
+            return Err(InoxSetError::Configuration(format!(
+                "{op} spans {} periods, limit is {}",
+                periods.len(),
+                MAX_RANGE_PERIODS,
+            )));
+        }
+        Ok(periods)
     }
 
     /// Enumerates all periods from `start` to `end` (inclusive).

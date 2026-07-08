@@ -1147,3 +1147,304 @@ fn cardinality_range_invalid_bound_is_rejected() {
         .unwrap();
     assert!(got.is_empty(), "reversed bounds must yield empty, not hang");
 }
+
+// --- Range writes (interval membership) ---
+
+#[test]
+fn put_bitmap_range_writes_every_bucket_across_month_boundary() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let bm = bm_of(&[1, 2, 3]);
+
+    s.put_bitmap_range(
+        "stay",
+        Period::Day(2026, 3, 28),
+        Period::Day(2026, 4, 3),
+        bm.clone(),
+    )
+    .unwrap();
+
+    let days = [
+        Period::Day(2026, 3, 28),
+        Period::Day(2026, 3, 29),
+        Period::Day(2026, 3, 30),
+        Period::Day(2026, 3, 31),
+        Period::Day(2026, 4, 1),
+        Period::Day(2026, 4, 2),
+        Period::Day(2026, 4, 3),
+    ];
+    for d in days {
+        assert_eq!(s.get("stay", d).unwrap(), bm, "bucket {d:?} pre-flush");
+    }
+    assert!(s.get("stay", Period::Day(2026, 3, 27)).unwrap().is_empty());
+    assert!(s.get("stay", Period::Day(2026, 4, 4)).unwrap().is_empty());
+
+    s.flush().unwrap();
+    for d in days {
+        assert_eq!(s.get("stay", d).unwrap(), bm, "bucket {d:?} post-flush");
+    }
+}
+
+#[test]
+fn put_bitmap_range_rollup_ancestors_across_boundary() {
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+    let bm = bm_of(&[42]);
+
+    s.put_bitmap_range(
+        "ev",
+        Period::Hour(2026, 1, 31, 22),
+        Period::Hour(2026, 2, 1, 1),
+        bm,
+    )
+    .unwrap();
+
+    for p in [
+        Period::Day(2026, 1, 31),
+        Period::Day(2026, 2, 1),
+        Period::Month(2026, 1),
+        Period::Month(2026, 2),
+        Period::Year(2026),
+    ] {
+        assert!(s.get("ev", p).unwrap().contains(42), "ancestor {p:?}");
+    }
+}
+
+#[test]
+fn put_bitmap_range_or_accumulates_with_existing_data() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let p = Period::Day(2026, 3, 11);
+
+    s.put_bitmap("ev", p, bm_of(&[1])).unwrap();
+    s.flush().unwrap();
+    s.put_bitmap_range("ev", p, Period::Day(2026, 3, 12), bm_of(&[2]))
+        .unwrap();
+
+    let got = s.get("ev", p).unwrap();
+    assert!(got.contains(1) && got.contains(2));
+    assert_eq!(s.get("ev", Period::Day(2026, 3, 12)).unwrap(), bm_of(&[2]));
+}
+
+#[test]
+fn put_ids_range_shares_internal_ids_and_indexes() {
+    let dir = TempDir::new().unwrap();
+    let s = store_with_index(&dir);
+    let first = Period::Day(2026, 3, 11);
+    let last = Period::Day(2026, 3, 13);
+
+    s.put_ids_range("stay", first, last, &["guest-123"]).unwrap();
+    s.flush().unwrap();
+
+    // Same internal id in every bucket → identical bitmaps.
+    let b1 = s.get("stay", first).unwrap();
+    let b2 = s.get("stay", Period::Day(2026, 3, 12)).unwrap();
+    let b3 = s.get("stay", last).unwrap();
+    assert_eq!(b1, b2);
+    assert_eq!(b2, b3);
+    assert_eq!(b1.len(), 1);
+
+    // Reverse lookup sees all three buckets.
+    let memberships = s.find_memberships("guest-123").unwrap();
+    assert_eq!(memberships.len(), 3);
+}
+
+#[test]
+fn put_range_supersedes_pending_remove_at_bucket_and_ancestors() {
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+    let h = Period::Hour(2026, 3, 11, 14);
+
+    s.put_bitmap("ev", h, bm_of(&[42])).unwrap();
+    s.remove_bits("ev", h, &[42]).unwrap();
+
+    s.put_bitmap_range("ev", h, Period::Hour(2026, 3, 11, 16), bm_of(&[42]))
+        .unwrap();
+
+    assert!(s.get("ev", h).unwrap().contains(42));
+    assert!(s.get("ev", Period::Day(2026, 3, 11)).unwrap().contains(42));
+    assert!(s.get("ev", Period::Month(2026, 3)).unwrap().contains(42));
+    assert!(s.get("ev", Period::Year(2026)).unwrap().contains(42));
+}
+
+#[test]
+fn range_write_error_cases() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let bm = bm_of(&[1]);
+
+    // Reversed bounds: error, not silent no-op.
+    assert!(s
+        .put_bitmap_range("ev", Period::Day(2026, 3, 12), Period::Day(2026, 3, 10), bm.clone())
+        .is_err());
+    // Mixed granularities.
+    assert!(s
+        .put_bitmap_range("ev", Period::Day(2026, 3, 10), Period::Hour(2026, 3, 12, 0), bm.clone())
+        .is_err());
+    // Static bounds.
+    assert!(s
+        .put_bitmap_range("ev", Period::Static, Period::Static, bm.clone())
+        .is_err());
+    // Granularity differs from the event's finest (event is Day-granularity).
+    assert!(s
+        .put_bitmap_range(
+            "ev",
+            Period::Hour(2026, 3, 10, 0),
+            Period::Hour(2026, 3, 10, 5),
+            bm.clone()
+        )
+        .is_err());
+    // Invalid calendar component.
+    assert!(s
+        .put_bitmap_range("ev", Period::Day(2026, 2, 1), Period::Day(2026, 2, 30), bm.clone())
+        .is_err());
+    // Oversized range (> 366 days... use Month granularity? 366*24 days ≈ 24 years).
+    assert!(s
+        .put_bitmap_range("ev", Period::Day(2000, 1, 1), Period::Day(2026, 1, 1), bm.clone())
+        .is_err());
+    // Same errors on the remove side.
+    assert!(s
+        .remove_bits_range("ev", Period::Day(2026, 3, 12), Period::Day(2026, 3, 10), &[1])
+        .is_err());
+}
+
+#[test]
+fn put_bitmap_range_empty_bitmap_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    s.put_bitmap_range(
+        "ev",
+        Period::Day(2026, 3, 11),
+        Period::Day(2026, 3, 20),
+        RoaringBitmap::new(),
+    )
+    .unwrap();
+    s.flush().unwrap();
+    assert!(s.list_periods("ev").unwrap().is_empty());
+}
+
+#[test]
+fn put_bitmap_range_backfills_compacted_periods() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let first = Period::Day(2020, 1, 1);
+    let last = Period::Day(2020, 1, 3);
+
+    s.put_bitmap_range("ev", first, last, bm_of(&[1])).unwrap();
+    s.flush().unwrap();
+    s.compact().unwrap();
+
+    // Backfill into the (closed, compacted) periods.
+    s.put_bitmap_range("ev", first, last, bm_of(&[2])).unwrap();
+    s.flush().unwrap();
+
+    for d in [first, Period::Day(2020, 1, 2), last] {
+        let got = s.get("ev", d).unwrap();
+        assert!(got.contains(1) && got.contains(2), "backfill merge at {d:?}");
+    }
+}
+
+#[test]
+fn remove_bits_range_tombstones_buckets_and_ancestors() {
+    let dir = TempDir::new().unwrap();
+    let s = store_with_rollup(&dir);
+
+    // Seed hours 10..=12 with {42, 7}, flush.
+    s.put_bitmap_range(
+        "ev",
+        Period::Hour(2026, 3, 11, 10),
+        Period::Hour(2026, 3, 11, 12),
+        bm_of(&[42, 7]),
+    )
+    .unwrap();
+    s.flush().unwrap();
+
+    // Remove 42 over hours 10..=11.
+    s.remove_bits_range(
+        "ev",
+        Period::Hour(2026, 3, 11, 10),
+        Period::Hour(2026, 3, 11, 11),
+        &[42],
+    )
+    .unwrap();
+
+    assert!(!s.get("ev", Period::Hour(2026, 3, 11, 10)).unwrap().contains(42));
+    assert!(!s.get("ev", Period::Hour(2026, 3, 11, 11)).unwrap().contains(42));
+    // Hour 12 was outside the removal range.
+    assert!(s.get("ev", Period::Hour(2026, 3, 11, 12)).unwrap().contains(42));
+    // Documented rollup-erasure semantics: the delta propagates to the Day
+    // rollup even though hour 12 still contains 42.
+    assert!(!s.get("ev", Period::Day(2026, 3, 11)).unwrap().contains(42));
+    // 7 untouched everywhere.
+    assert!(s.get("ev", Period::Day(2026, 3, 11)).unwrap().contains(7));
+}
+
+#[test]
+fn remove_ids_range_ignores_unknown_ids() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let first = Period::Day(2026, 3, 11);
+    let last = Period::Day(2026, 3, 12);
+
+    s.put_ids_range("ev", first, last, &["alice"]).unwrap();
+    // "ghost" was never assigned: silently ignored, "alice" removed.
+    s.remove_ids_range("ev", first, last, &["ghost", "alice"])
+        .unwrap();
+
+    assert!(s.get("ev", first).unwrap().is_empty());
+    assert!(s.get("ev", last).unwrap().is_empty());
+}
+
+#[test]
+fn remove_range_then_put_single_bucket_reinserts() {
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let first = Period::Day(2026, 3, 11);
+    let last = Period::Day(2026, 3, 13);
+
+    s.put_ids_range("ev", first, last, &["alice"]).unwrap();
+    s.flush().unwrap();
+    s.remove_ids_range("ev", first, last, &["alice"]).unwrap();
+
+    // Re-insert into one bucket only: put supersedes the pending remove there.
+    s.put_ids("ev", Period::Day(2026, 3, 12), &["alice"]).unwrap();
+
+    assert!(s.get("ev", first).unwrap().is_empty());
+    assert!(!s.get("ev", Period::Day(2026, 3, 12)).unwrap().is_empty());
+    assert!(s.get("ev", last).unwrap().is_empty());
+}
+
+#[test]
+fn builder_rejects_unimplemented_immediate_freshness() {
+    let dir = TempDir::new().unwrap();
+    let result = InoxSet::builder()
+        .path(dir.path().join("data"))
+        .index_freshness(inoxset::IndexFreshness::Immediate)
+        .open();
+    assert!(
+        result.is_err(),
+        "Immediate must fail loud instead of silently degrading to Disabled"
+    );
+}
+
+#[cfg(feature = "uuid")]
+#[test]
+fn uuid_range_roundtrip() {
+    use uuid::Uuid;
+    let dir = TempDir::new().unwrap();
+    let s = store(&dir);
+    let first = Period::Day(2026, 3, 11);
+    let last = Period::Day(2026, 3, 13);
+    let id = Uuid::new_v4();
+
+    s.put_uuids_range("ev", first, last, &[id]).unwrap();
+    for d in [first, Period::Day(2026, 3, 12), last] {
+        assert_eq!(s.get_uuids("ev", d).unwrap(), vec![id]);
+    }
+
+    s.remove_uuids_range("ev", first, Period::Day(2026, 3, 12), &[id])
+        .unwrap();
+    assert!(s.get_uuids("ev", first).unwrap().is_empty());
+    assert!(s.get_uuids("ev", Period::Day(2026, 3, 12)).unwrap().is_empty());
+    assert_eq!(s.get_uuids("ev", last).unwrap(), vec![id]);
+}

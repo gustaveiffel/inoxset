@@ -47,6 +47,30 @@ let today = store.get("logins", Period::Day(2026, 3, 18))?;
 let march = store.get("logins", Period::Month(2026, 3))?;
 ```
 
+### Interval membership
+
+Interval-shaped facts — a hotel stay, a subscription, a policy coverage period, a contract — write every covered bucket in **one atomic call**. Readers never observe a partially applied interval, rollup ancestors update once per distinct ancestor, and the dictionary is resolved once.
+
+```rust
+// Guest in-house from March 11 through March 13 (inclusive bounds)
+store.put_ids_range(
+    "in_house",
+    Period::Day(2026, 3, 11),
+    Period::Day(2026, 3, 13),
+    &["guest-123"],
+)?;
+
+// Distinct-guest occupancy per day is now a single query
+let occupancy = store.cardinality_range(
+    "in_house",
+    Period::Day(2026, 3, 1),
+    Period::Day(2026, 3, 31),
+)?;
+
+// Interval corrections mirror the write
+store.remove_ids_range("in_house", check_in, last_night, &["guest-123"])?;
+```
+
 ### Dictionary encoding
 
 Map arbitrary string IDs (UUID, nanoid, any string) to u32 values transparently. The mapping is global: the same ID always maps to the same u32 across all events, so cross-event set operations produce correct results.
@@ -158,6 +182,8 @@ let bm = tokio::task::spawn_blocking(move || {
 | Method | Description |
 |--------|-------------|
 | `put_bitmap` | OR a bitmap into a time period (auto-registers events) |
+| `put_bitmap_range` / `put_ids_range` | Write every bucket of an interval in one atomic call |
+| `remove_bits_range` / `remove_ids_range` | Tombstone an interval (same atomicity) |
 | `get` | Read the merged bitmap for an event + period |
 | `get_range` | Read multiple periods at once |
 | `flush` | Persist in-memory buffer to disk |
@@ -170,6 +196,7 @@ let bm = tokio::task::spawn_blocking(move || {
 | `cardinality` | Count distinct IDs (O(1) for compacted periods) |
 | `intersect_cardinality` | Count intersection without allocating intermediate bitmap |
 | `union_cardinality` | Count union without allocating intermediate bitmap |
+| `union_cardinality_many` / `intersect_cardinality_many` | N-way counts over many (event, period) keys |
 | `cardinality_range` | Time-series cardinality for a period range |
 | `exists` | Check if any data exists for an event + period |
 
@@ -179,6 +206,7 @@ let bm = tokio::task::spawn_blocking(move || {
 |--------|-------------|
 | `put_ids` / `get_ids` | Write/read external string IDs |
 | `put_uuids` / `get_uuids` | Write/read UUIDs (requires `uuid` feature) |
+| `put_uuids_range` / `remove_uuids_range` | Interval writes for UUIDs (requires `uuid` feature) |
 | `remove_ids` / `remove_uuids` | Delete by external ID |
 
 ### Set expressions
@@ -230,7 +258,7 @@ let batch = dict.get_or_assign_batch(&["a", "b", "c"])?; // Vec<u32>
 
 ```toml
 [dependencies]
-inoxset = "0.1.0-alpha.4"
+inoxset = "0.1.0-alpha.5"
 roaring = "0.10"
 
 # Optional: UUID support
